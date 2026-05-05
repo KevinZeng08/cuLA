@@ -27,7 +27,7 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import Float32, Int32, Int64, BFloat16
 from fla.ops.utils import prepare_chunk_indices
 
-from cula.utils import USE_FAST_MATH, assert_blackwell
+from cula.utils import USE_FAST_MATH, assert_blackwell, prepare_uniform_cu_seqlens
 
 from cula.ops.intrinsics_sm100 import (
     tcgen05_fence_before,
@@ -415,7 +415,7 @@ class ChunkKdaBwdWyDqkgFused:
         g_dtype: type[cutlass.Numeric] = cutlass.Float32,
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
         scale: float = 1.0,
-        min_occupancy: int = 1, # FIXME: change to 2, bug exists for accuracy
+        min_occupancy: int = 1,
         use_fast_math: bool = True,
     ):
         assert chunk_size == 64, "chunk_size must be 64"
@@ -1779,7 +1779,7 @@ class ChunkKdaBwdWyDqkgFused:
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 pipeline_load_beta.consumer_wait(load_beta_consumer_state)
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
 
                 beta_val = sBeta[(row,)]
                 db_val = Float32(0.0)
@@ -1963,7 +1963,7 @@ class ChunkKdaBwdWyDqkgFused:
                     chunk = cute.local_tile(dw_bf16_rmem, (8,), (i,))
                     smem_store_bf16x8_sw128(sDw_raw_ptr, row, col_base, chunk)
 
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_prologue_dw.producer_commit(prologue_dw_producer_state)
                 prologue_dw_producer_state.advance()
 
@@ -2000,7 +2000,7 @@ class ChunkKdaBwdWyDqkgFused:
                     chunk_kg = cute.local_tile(rKG_bf16, (8,), (i,))
                     smem_store_bf16x8_sw128(sK_raw_ptr, row, col_base, chunk_kg)
 
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_prologue_kg.producer_commit(prologue_kg_producer_state)
                 prologue_kg_producer_state.advance()
 
@@ -2072,7 +2072,7 @@ class ChunkKdaBwdWyDqkgFused:
 
                 if wg_idx == 0:
                     sum = Float32(0.0)
-                    for r in cutlass.range_constexpr(self.BT):
+                    for r in cutlass.range(self.BT, unroll_full=True):
                         sum += sG_raw[(r, local_tidx, 0)]
                     sDgk[(local_tidx, )] += sum
 
@@ -2190,7 +2190,7 @@ class ChunkKdaBwdWyDqkgFused:
                     chunk_dA = cute.local_tile(rDA, (8,), (i,))
                     smem_store_bf16x8_sw128(sQ_raw_ptr, row, col_base, chunk_dA)
                 # notify dA2 = dA @ A
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_prologue_dA2.producer_commit(prologue_dA2_producer_state)
                 prologue_dA2_producer_state.advance()
 
@@ -2221,7 +2221,7 @@ class ChunkKdaBwdWyDqkgFused:
                     chunk_dA2 = cute.local_tile(rDA2, (8,), (i,))
                     smem_store_bf16x8_sw128(sQ_raw_ptr, row, col_base, chunk_dA2)
 
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_prologue_dA3.producer_commit(prologue_dA3_producer_state)
                 prologue_dA3_producer_state.advance()
 
@@ -2586,10 +2586,7 @@ class ChunkKdaBwdWyDqkgFused:
                                 # address stores to avoid layout-coordinate ambiguity.
                                 smem_store_bf16x8_sw128(sA_raw, row, col * 8, zeros8)
                     # Make generic-proxy SMEM stores visible to UMMA async-proxy readers.
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 self.mma_warp_sync_barrier.arrive_and_wait()
 
                 for v_iter in cutlass.range(self.num_v_tiles):
@@ -2608,10 +2605,7 @@ class ChunkKdaBwdWyDqkgFused:
                                 for col in cutlass.range_constexpr(self.BV // 8):
                                     # dv tile uses the same Swizzle<3,4,3> physical mapping.
                                     smem_store_bf16x8_sw128(sDo_raw_ptr, row, col * 8, zeros8)
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
-                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                     self.mma_warp_sync_barrier.arrive_and_wait()
                     
                     if v_iter == 0:
@@ -2648,10 +2642,7 @@ class ChunkKdaBwdWyDqkgFused:
                                 for col in cutlass.range_constexpr(self.BV // 8):
                                     # dv tile uses the same Swizzle<3,4,3> physical mapping.
                                     smem_store_bf16x8_sw128(sDv_raw, row, col * 8, zeros8)
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
-                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                     self.mma_warp_sync_barrier.arrive_and_wait()
                     
                     # if lane_idx == 0:
@@ -2692,10 +2683,7 @@ class ChunkKdaBwdWyDqkgFused:
                                 for col in cutlass.range_constexpr(self.BV // 8):
                                     # dv tile uses the same Swizzle<3,4,3> physical mapping.
                                     smem_store_bf16x8_sw128(sV_raw, row, col * 8, zeros8)
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
-                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                     self.mma_warp_sync_barrier.arrive_and_wait()
                     if v_iter == 0:
                         pipeline_mma_dA.producer_acquire(mma_dA_producer_state)
@@ -2735,10 +2723,7 @@ class ChunkKdaBwdWyDqkgFused:
                                 for col in cutlass.range_constexpr(self.BV // 8):
                                     # dv tile uses the same Swizzle<3,4,3> physical mapping.
                                     smem_store_bf16x8_sw128(sDvnew_raw_ptr, row, col * 8, zeros8)
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
-                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                     self.mma_warp_sync_barrier.arrive_and_wait()
 
                     pipeline_load_dh.consumer_wait(load_dh_consumer_state)
@@ -2772,7 +2757,7 @@ class ChunkKdaBwdWyDqkgFused:
                     vloop_stage_idx = (vloop_stage_idx + 1) % self.vloop_stage
                 
                 pipeline_prologue_dw.consumer_wait(prologue_dw_consumer_state)
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 # dkgb = A @ dw
                 pipeline_mma_dkgb.producer_acquire(mma_dgkb_producer_state)
                 sA_mn_cur = sA_mn[(None, None, None, a_stage_idx)]
@@ -2787,7 +2772,7 @@ class ChunkKdaBwdWyDqkgFused:
                 mma_dgkb_producer_state.advance()
 
                 pipeline_prologue_kg.consumer_wait(prologue_kg_consumer_state)
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 # dA += dw @ kg^T
                 sDw_k_cur = sDw_k[(None, None, None, 0)]
                 sKG_k_cur = sKG_k[(None, None, None, 0)]
@@ -2808,7 +2793,7 @@ class ChunkKdaBwdWyDqkgFused:
                 # dA2 = dA @ A
                 pipeline_mma_dA2.producer_acquire(mma_dA2_producer_state)
                 pipeline_prologue_dA2.consumer_wait(prologue_dA2_consumer_state)
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
 
                 sDA_k_cur = sDA_k[(None, None, None, 0)]
                 sA_k_cur = sA_k[(None, None, None, 0)]
@@ -2826,7 +2811,7 @@ class ChunkKdaBwdWyDqkgFused:
                 # dA3 = A @ dA2
                 pipeline_mma_dA3.producer_acquire(mma_dA3_producer_state)
                 pipeline_prologue_dA3.consumer_wait(prologue_dA3_consumer_state)
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy("async.shared", space="cta")
 
                 sA_mn_cur = sA_mn[(None, None, None, 0)]
                 sDA_mn_cur = sDA_mn[(None, None, None, 0)]
@@ -2873,10 +2858,7 @@ class ChunkKdaBwdWyDqkgFused:
                     beta_f32 = Float32(beta_gmem[(tok_offset + tile_idx * self.BT + tidx, (head_idx, Int32(0)))])
                 sBeta[(tidx, )] = beta_f32
 
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_load_beta.producer_commit(load_beta_producer_state)
                 load_beta_producer_state.advance()
 
@@ -3101,13 +3083,16 @@ def chunk_kda_bwd_wy_dqkg_fused(
     Returns:
         (dq, dk, dv2, db, dg, dA) matching FLA's chunk_kda_bwd_wy_dqkg_fused output order.
     """
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-
     B, T, H, K = q.shape
     V = v.shape[3]
     BT = chunk_size
     beta_dtype = beta.dtype
+    device = q.device
+
+    if cu_seqlens is None:
+        cu_seqlens = prepare_uniform_cu_seqlens(B, T, device, torch.int32)
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     if scale is None:
         scale = K**-0.5
@@ -3115,19 +3100,18 @@ def chunk_kda_bwd_wy_dqkg_fused(
     assert cu_seqlens is not None and chunk_indices is not None
     # Ensure cu_seqlens is int32
     assert cu_seqlens.dtype == torch.int32, "cu_seqlens must be int32"
-    assert q.dim() == 4 and q.shape[0] == 1
-    T_total = q.shape[1]
+    T_total = B * T
     num_seqs = cu_seqlens.shape[0] - 1
     total_nt_val = chunk_indices.shape[0]
     ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
 
     # Allocate output tensors
-    dq = torch.empty_like(q, dtype=torch.float32)
-    dk = torch.empty_like(k, dtype=torch.float32)
-    dv2 = torch.empty_like(v)  # bf16
-    dg = torch.empty_like(g, dtype=torch.float32)
-    db = torch.empty(B, T, H, dtype=torch.float32, device=q.device)
-    dA = torch.empty(B, T, H, BT, dtype=torch.float32, device=q.device)
+    dq = torch.empty(1, T_total, H, K, dtype=torch.float32, device=device)
+    dk = torch.empty(1, T_total, H, K, dtype=torch.float32, device=device)
+    dv2 = torch.empty(1, T_total, H, V, dtype=torch.bfloat16, device=device)
+    dg = torch.empty(1, T_total, H, K, dtype=torch.float32, device=device)
+    db = torch.empty(1, T_total, H, dtype=torch.float32, device=device)
+    dA = torch.empty(1, T_total, H, BT, dtype=torch.float32, device=device)
 
     compiled_fn = _get_compiled_bwd_wy(
         H,
@@ -3137,6 +3121,19 @@ def chunk_kda_bwd_wy_dqkg_fused(
         chunk_size,
         beta_dtype,
     )
+
+    if B != 1:
+        q = q.reshape(1, T_total, H, K)
+        k = k.reshape(1, T_total, H, K)
+        v = v.reshape(1, T_total, H, V)
+        v_new = v_new.reshape(1, T_total, H, V)
+        g = g.reshape(1, T_total, H, K)
+        beta = beta.reshape(1, T_total, H)
+        A = A.reshape(1, T_total, H, BT)
+        h = h.reshape(1, total_nt_val, H, K, V)
+        do = do.reshape(1, T_total, H, V)
+        dh = dh.reshape(1, total_nt_val, H, K, V)
+        dv = dv.reshape(1, T_total, H, V)
 
     # TVM-FFI call
     compiled_fn(
@@ -3165,6 +3162,15 @@ def chunk_kda_bwd_wy_dqkg_fused(
         ps,
         Int32(total_nt_val),
     )
+
+    # rearrange back
+    if B != 1:
+        dq = dq.reshape(B, T, H, K)
+        dk = dk.reshape(B, T, H, K)
+        dv2 = dv2.reshape(B, T, H, V)
+        dg = dg.reshape(B, T, H, K)
+        db = db.reshape(B, T, H)
+        dA = dA.reshape(B, T, H, BT)
 
     return dq, dk, dv2, db, dg, dA
 
