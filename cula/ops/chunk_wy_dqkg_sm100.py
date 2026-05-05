@@ -2053,11 +2053,6 @@ class ChunkKdaBwdWyDqkgFused:
                 else:
                     rDk.fill(Float32(0.0))
 
-                # dgk *= exp2(gn)
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                if wg_idx == 0:
-                    sDgk[(local_tidx, )] *= cute.exp2(sGn[(local_tidx,)], fastmath=self.use_fast_math)
-
                 # kdk = k * dk
                 rKdk = cute.make_rmem_tensor((bk_num_cols_per_wg,), Float32)
                 rKdk.store(rK_fp32.load() * rDk.load())
@@ -2093,6 +2088,11 @@ class ChunkKdaBwdWyDqkgFused:
                     smem_store_f32x4_sw128(sG_raw_ptr, row, col_base, chunk_kdk)
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
+                # dgk *= exp2(gn)
+                if wg_idx == 0:
+                    sDgk[(local_tidx, )] *= cute.exp2(sGn[(local_tidx,)], fastmath=self.use_fast_math)
+
+                self.cuda_wg_sync_barrier.arrive_and_wait()
                 if wg_idx == 0:
                     sum = Float32(0.0)
                     for r in cutlass.range(self.BT, unroll_full=True):
