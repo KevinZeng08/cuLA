@@ -2062,23 +2062,6 @@ class ChunkKdaBwdWyDqkgFused:
                 rKdk = cute.make_rmem_tensor((bk_num_cols_per_wg,), Float32)
                 rKdk.store(rK_fp32.load() * rDk.load())
 
-                # dgk += sum(kdk, axis=0)
-                # write kdk to G SMEM then do BT-dim reduce
-                for i in cutlass.range_constexpr(self.BK // 4 // 4):
-                    col_base = bk_col_base + i * 4
-                    chunk_kdk = cute.local_tile(rKdk, (4,), (i,))
-                    smem_store_f32x4_sw128(sG_raw_ptr, row, col_base, chunk_kdk)
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-
-                if wg_idx == 0:
-                    sum = Float32(0.0)
-                    for r in cutlass.range(self.BT, unroll_full=True):
-                        sum += sG_raw[(r, local_tidx, 0)]
-                    sDgk[(local_tidx, )] += sum
-
-                pipeline_load_g.consumer_release(load_g_consumer_state)
-                load_g_consumer_state.advance()
-
                 # gb = gk_exp * beta[:, None]
                 rGb = cute.make_rmem_tensor((bk_num_cols_per_wg, ), Float32)
                 rGb.store(rG_exp_val * beta_val)
@@ -2101,6 +2084,23 @@ class ChunkKdaBwdWyDqkgFused:
                     for s in cutlass.range_constexpr(num_stores_f32):
                         chunk_dk = subvec(dk_i32_vec, s * 8, 8)
                         store_256b(dk_base_addr + s * 32, chunk_dk)
+
+                # dgk += sum(kdk, axis=0)
+                # write kdk to G SMEM then do BT-dim reduce
+                for i in cutlass.range_constexpr(self.BK // 4 // 4):
+                    col_base = bk_col_base + i * 4
+                    chunk_kdk = cute.local_tile(rKdk, (4,), (i,))
+                    smem_store_f32x4_sw128(sG_raw_ptr, row, col_base, chunk_kdk)
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                if wg_idx == 0:
+                    sum = Float32(0.0)
+                    for r in cutlass.range(self.BT, unroll_full=True):
+                        sum += sG_raw[(r, local_tidx, 0)]
+                    sDgk[(local_tidx, )] += sum
+
+                pipeline_load_g.consumer_release(load_g_consumer_state)
+                load_g_consumer_state.advance()
 
                 # dg1 = kg * dkgb * beta[:, None], can reuse kg RMEM
                 rDg = cute.make_rmem_tensor((bk_num_cols_per_wg,), Float32)
@@ -2204,9 +2204,6 @@ class ChunkKdaBwdWyDqkgFused:
                 tcgen05_fence_before()
                 cute.arch.fence_view_async_tmem_load()
 
-                pipeline_mma_dA2.consumer_release(mma_dA2_consumer_state)
-                mma_dA2_consumer_state.advance()
-
                 pipeline_prologue_dA3.producer_acquire(prologue_dA3_producer_state)
                 # write dA2 to smem notify dA2 = A @ dA2
                 dA2_f32 = reinterpret_cast(dA2_i32, Int32, bt_num_cols_per_wg, Float32)
@@ -2232,6 +2229,9 @@ class ChunkKdaBwdWyDqkgFused:
                 tcgen05_fence_before()
                 cute.arch.fence_view_async_tmem_load()
 
+                # release mma dA2 after dA3 is finished, protect DA2 TMEM
+                pipeline_mma_dA2.consumer_release(mma_dA2_consumer_state)
+                mma_dA2_consumer_state.advance()
                 pipeline_mma_dA3.consumer_release(mma_dA3_consumer_state)
                 mma_dA3_consumer_state.advance()
                 # NOTE: release smem Q because we reuse to store bf16 dA
@@ -2619,8 +2619,6 @@ class ChunkKdaBwdWyDqkgFused:
                     desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
                     desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                     mma_ws_ss_m64n128_k_k_call(vloop_opA_smem, desc_a_base, vloop_opB_smem, desc_b_base, TMEM_DQ_ACC_OFF, self.BV, is_accum)
-
-                    # TODO: should we add tcgen05.commit and mbar.wait to ensure current dq MMA has been finished?
 
                     pipeline_load_do.consumer_release(load_do_consumer_state)
                     load_do_consumer_state.advance()
