@@ -184,7 +184,6 @@ def smem_load_bf16x8_sw128(raw_ptr: cute.Pointer, row: Int32, col_base: Int32):
     cute.autovec_copy(smem_t, rmem_t)
     return rmem_t
 
-# TODO: is this bug for K_TILE != 128?
 @cute.jit
 def smem_store_bf16x8_sw128(raw_ptr: cute.Pointer, row: Int32, col_base: Int32, data: cute.Tensor):
     """
@@ -1773,6 +1772,12 @@ class ChunkKdaBwdWyDqkgFused:
                 seq_len = cu_seqlens[(batch_idx + 1,)] - tok_offset
                 sub_seq_len = min(self.BT, seq_len - tile_idx * self.BT)
 
+                # NOTE: must sync before next wu_iter's `sDgk[local_tidx] = 0`
+                # init, otherwise WG0 of next iter may overwrite sDgk while
+                # WG1 of this iter (row == sub_seq_len - 1 lane) is still
+                # reading sDgk[col] above. This was the source of the
+                # non-deterministic dg accuracy bug.
+                self.cuda_wg_sync_barrier.arrive_and_wait()
                 # fill db, dgk to 0
                 if local_tidx < self.BT:
                     sDb[local_tidx] = Float32(0.0)
@@ -1888,7 +1893,6 @@ class ChunkKdaBwdWyDqkgFused:
                 pipeline_load_g.consumer_wait(load_g_consumer_state)
                 # write to gn
                 sGn[local_tidx] = sG_raw[(sub_seq_len - 1, local_tidx, 0)]
-                self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # row-major load, match TMEM layout
                 rG = cute.make_rmem_tensor((self.BK // 4, ), self.g_dtype)
@@ -2133,12 +2137,6 @@ class ChunkKdaBwdWyDqkgFused:
                     for i in cutlass.range_constexpr(bk_num_cols_per_wg):
                         col = bk_col_base + i
                         rDg[i] += sDgk[(col,)]
-                # NOTE: must sync before next wu_iter's `sDgk[local_tidx] = 0`
-                # init, otherwise WG0 of next iter may overwrite sDgk while
-                # WG1 of this iter (row == sub_seq_len - 1 lane) is still
-                # reading sDgk[col] above. This was the source of the
-                # non-deterministic dg accuracy bug.
-                self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 rDg_val = rDg.load()
                 dg_i32_vec = reinterpret_cast(
