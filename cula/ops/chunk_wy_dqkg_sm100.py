@@ -463,7 +463,7 @@ class ChunkKdaBwdWyDqkgFused:
         # V-loop TMA: 2-stage double buffer
         self.vloop_stage = 2
         self.kloop_stage = 1
-        self.a_stage = 1 # TODO: increase to 2
+        self.a_stage = 2
         self.mma_stage = 1
 
         # ── MMA tiler shapes ──
@@ -820,7 +820,7 @@ class ChunkKdaBwdWyDqkgFused:
             dA2post_tiled_mma,
             self.dApost_tiler,
             self.io_dtype,
-            self.a_stage,
+            self.mma_stage,
         )
 
         # opB: A K-major [BT,BT]
@@ -836,7 +836,7 @@ class ChunkKdaBwdWyDqkgFused:
             dA3post_tiled_mma,
             self.dApost_tiler,
             self.io_dtype,
-            self.a_stage,
+            self.mma_stage,
         )
 
         # --- Epilogue (non-MMA) layouts ---
@@ -1436,6 +1436,8 @@ class ChunkKdaBwdWyDqkgFused:
         sH_ptr_base = storage.buf_h.data_ptr().toint()
         sDh_ptr_base = storage.buf_dh.data_ptr().toint()
         vloop_opB_bytes_per_stage = cute.size_in_bytes(self.io_dtype, vloop_opB_smem_no_stage)
+        sA_ptr_base = storage.buf_A.data_ptr().toint()
+        A_bytes_per_stage = cute.size_in_bytes(self.io_dtype, A_mn_opA_smem_no_stage)
 
         # NOTE: make_umma_smem_desc requires the iterator to carry the swizzle
         # (and ≥16B alignment). When constructing a tensor over a ComposedLayout
@@ -2312,7 +2314,7 @@ class ChunkKdaBwdWyDqkgFused:
                 seq_len = cu_seqlens[(batch_idx + 1,)] - tok_offset
                 sub_seq_len = min(self.BT, seq_len - tile_idx * self.BT)
 
-                # Load A, TODO: double-buffer?
+                # Load A
                 tma_A_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_A)
                 tAsA, tAgA = self._tma_partition_A(
                     tma_atom_A,
@@ -2577,6 +2579,11 @@ class ChunkKdaBwdWyDqkgFused:
                 zeros8.fill(BFloat16(0.0))
 
                 pipeline_load_A.consumer_wait(load_A_consumer_state)
+                sA_raw_ptr = cute.make_ptr(
+                    self.io_dtype,
+                    sA_ptr_base + a_stage_idx * A_bytes_per_stage,
+                    cute.AddressSpace.smem,
+                )
                 if sub_seq_len < self.BT:
                     for i in cutlass.range_constexpr(self.BT // 32):
                         row = i * 32 + lane_idx
@@ -2584,7 +2591,7 @@ class ChunkKdaBwdWyDqkgFused:
                             for col in cutlass.range_constexpr(self.BT // 8):
                                 # A tile is MN_SW128 in shared memory; use raw swizzled
                                 # address stores to avoid layout-coordinate ambiguity.
-                                smem_store_bf16x8_sw128(sA_raw, row, col * 8, zeros8)
+                                smem_store_bf16x8_sw128(sA_raw_ptr, row, col * 8, zeros8)
                     # Make generic-proxy SMEM stores visible to UMMA async-proxy readers.
                     cute.arch.fence_proxy("async.shared", space="cta")
                 self.mma_warp_sync_barrier.arrive_and_wait()
@@ -2794,7 +2801,7 @@ class ChunkKdaBwdWyDqkgFused:
                 cute.arch.fence_proxy("async.shared", space="cta")
 
                 sDA_k_cur = sDA_k[(None, None, None, 0)]
-                sA_k_cur = sA_k[(None, None, None, 0)]
+                sA_k_cur = sA_k[(None, None, None, a_stage_idx)]
                 desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(sDA_k_cur.iterator, sDA_k_cur.layout, "k"))
                 desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(sA_k_cur.iterator, sA_k_cur.layout, "k"))
                 desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
@@ -2811,7 +2818,7 @@ class ChunkKdaBwdWyDqkgFused:
                 pipeline_prologue_dA3.consumer_wait(prologue_dA3_consumer_state)
                 cute.arch.fence_proxy("async.shared", space="cta")
 
-                sA_mn_cur = sA_mn[(None, None, None, 0)]
+                sA_mn_cur = sA_mn[(None, None, None, a_stage_idx)]
                 sDA_mn_cur = sDA_mn[(None, None, None, 0)]
                 desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(sA_mn_cur.iterator, sA_mn_cur.layout, "mn"))
                 desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(sDA_mn_cur.iterator, sDA_mn_cur.layout, "mn"))
