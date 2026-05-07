@@ -348,6 +348,46 @@ def tcgen05_cp_128x256b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
     _do(Int32(taddr), smem_desc.desc_i64[0])
 
 @cute.jit
+def tcgen05_cp_128x128b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
+    """Async copy SMEM → TMEM with shape ``128x128b`` (``cta_group::1``).
+
+    Issues ``tcgen05.cp.cta_group::1.128x128b  [taddr], s-desc;``
+    via the native ``nvvm.tcgen05.cp`` MLIR op.
+
+    The instruction copies a 128-row × 128-bit tile from shared memory
+    (described by *smem_desc*) into Tensor Memory at *taddr*.  The copy
+    is **asynchronous** — use ``tcgen05.commit`` + ``mbarrier.wait`` to
+    synchronize.
+
+    PTX reference
+    -------------
+        tcgen05.cp.cta_group::1.128x128b  [taddr], s-desc;
+
+    Parameters
+    ----------
+    taddr : int
+        TMEM destination address (uint32, passed as ``!llvm.ptr<6>``).
+    smem_desc : Tcgen05SmemDescriptor
+        64-bit SMEM matrix descriptor (same format as ``tcgen05.mma``
+        descriptors — see ``Tcgen05SmemDescriptor``).
+    """
+
+    @dsl_user_op
+    def _do(addr_val, desc_val, *, loc=None, ip=None):
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
+        _nvvm.tcgen05_cp(
+            shape=_nvvm.Tcgen05CpShape.SHAPE_128x128b,
+            taddr=tmem_ptr,
+            smem_desc=_to_ir(desc_val, loc, ip),
+            cta_group=_nvvm.Tcgen05GroupKind.CTA_1,
+            loc=loc,
+            ip=ip,
+        )
+
+    _do(Int32(taddr), smem_desc.desc_i64[0])
+
+@cute.jit
 def tcgen05_fence_before():
     """tcgen05.fence::before_thread_sync — non-blocking ordering fence."""
     _nvvm.tcgen05_fence(kind=_nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)

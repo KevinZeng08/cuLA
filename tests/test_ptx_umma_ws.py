@@ -47,10 +47,7 @@ from cutlass.cute.typing import Float16, Float32, Int32, Int64, TFloat32, BFloat
 from cula.ops.intrinsics_sm100 import (
     store_256b,
     subvec,
-    tcgen05_cp_128x256b,
-    reinterpret_cast,
     tcgen05_ld_32x32b,
-    tcgen05_st_32x32b,
 )
 from cula.ops.ptx_umma_ext import (
     CollectorBBuffer,
@@ -58,7 +55,6 @@ from cula.ops.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ws_ss_f16,
     tcgen05mma_ws_ss_tf32,
-    tcgen05mma_ws_ts_f16,
 )
 
 M_DIM, N_DIM = 64, 64
@@ -234,32 +230,7 @@ class _WsSsTf32Kernel:
 
 
 # =====================================================================
-# Test 2: tcgen05mma_ws_ts_tf32  (weight-stationary, TMEM A, SMEM B, tf32)
-# =====================================================================
-
-# TODO
-class _WsTsTf32Kernel:
-    """Two-step test:
-    - Region 0 (tmem_a_region): populate A into TMEM via S2T copy
-    - Region 1 (tmem_c_region): result of WS TS MMA (tmem_a × B → C)
-    """
-
-    @cute.kernel
-    def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
-        pass
-
-    @cute.jit
-    def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
-        self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
-
-    def run(self, A_cpu, B_cpu):
-        raise NotImplementedError(
-            "TODO: implement this test following the pattern of _WsSsTf32Kernel, but with the two-step approach described in the docstring"
-        )
-
-
-# =====================================================================
-# Test 3: tcgen05mma_ws_ss_f16  (weight-stationary, SMEM A, SMEM B, f16)
+# Test 2: tcgen05mma_ws_ss_f16  (weight-stationary, SMEM A, SMEM B, f16)
 # =====================================================================
 
 
@@ -437,216 +408,7 @@ class _WsSsF16Kernel:
 
 
 # =====================================================================
-# Test 4: tcgen05mma_ws_ts_f16  (weight-stationary, TMEM A, SMEM B, f16)
-# =====================================================================
-
-
-# TODO: support with first S2R then R2T with tcgen05.st
-class _WsTsF16Kernel:
-    """Two-step test (same strategy as _WsTsTf32Kernel but with kind::f16):
-    - Region 0 (tmem_a_region): populate A into TMEM via S2T copy
-    - Region 1 (tmem_c_region): result of WS TS MMA (tmem_a × B → C)
-    """
-    def __init__(self, M: int, N: int, K: int):
-        self.M = M
-        self.N = N
-        self.K = K
-        if N == 64:
-            self.idesc = IDESC_F16_M64_N64
-        elif N == 128:
-            self.idesc = IDESC_F16_M64_N128
-        else:
-            raise ValueError(f"Unsupported N={N} for F16 IDESC (expected 64 or 128)")
-        self.wg_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=3,
-            num_threads=128,
-        )
-
-    @cute.kernel
-    def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
-        M, N, K = self.M, self.N, self.K
-        idesc = self.idesc
-        ACC_NUM_COLS = N // 2
-        # Layout E (M=64 + .ws mode) for A operand in TMEM:
-        #   - 4 warps × 16 active lanes (lane<16) cover M=64 rows
-        #     warp w → rows [w*16 .. w*16+15]
-        #   - Each active lane stores its full K-row as bf16 pairs in 32-bit cells
-        #   - Per K-atom (16 BF16): 8 TMEM cols (16 active lanes × 8 dwords = 128 BF16 = 64 rows × 2 BF16-pairs)
-        #     wait: 16 lanes × 8 cols × 2 bf16/col = 256 BF16 per warp per K-atom; 4 warps × 256 = 1024 BF16 = 64×16 ✓
-        #   - Total cols for A^T[64, K]: K/2 cols
-        # ref: chunk_kda_bwd_sm100_tmem.cuh::pack_AT_to_tmem_bf16, FlashMLA SM100_UTCCP_128dp256bit
-        OPA_NUM_COLS = K // 2  # 8 cols per K-atom of 16 BF16
-        TMEM_OPA = 0
-        TMEM_ACC = TMEM_OPA + OPA_NUM_COLS
-        tidx, _, _ = cute.arch.thread_idx()
-        warp_idx = cute.arch.warp_idx()
-        warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        lane_idx = tidx % 32
-
-        smem = utils.SmemAllocator()
-        tmem_hold_ptr = smem.allocate(Int32)
-        mbar_ptr = smem.allocate(Int64, byte_alignment=8)
-
-        # Create MMA SMEM Layouts
-        # NOTE: we use non-ws mode TiledMMA for creating smem layout in a easy way,
-        # because smem layouts of ws mode and non-ws mode are the same
-        mma_tiler = (M, N, K)
-        non_ws_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            BFloat16,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
-            Float32,
-            tcgen05.CtaGroup.ONE,
-            (M, N),
-        )
-        a_smem_layout = sm100_utils.make_smem_layout_a(non_ws_tiled_mma, mma_tiler, BFloat16, 1)
-        b_smem_layout = sm100_utils.make_smem_layout_b(non_ws_tiled_mma, mma_tiler, BFloat16, 1)
-        bufferA = smem.allocate_tensor(
-            element_type=BFloat16,
-            layout=a_smem_layout.outer,
-            byte_alignment=128,
-            swizzle=a_smem_layout.inner,
-        )
-
-        bufferB = smem.allocate_tensor(
-            element_type=BFloat16,
-            layout=b_smem_layout.outer,
-            byte_alignment=128,
-            swizzle=b_smem_layout.inner,
-        )
-
-        bufA_s0 = bufferA[(None, None, None, 0)]
-        bufB_s0 = bufferB[(None, None, None, 0)]
-
-        if tidx == cutlass.Int32(0):
-            mbarrier_init(mbar_ptr, 1)
-        mbarrier_init_fence()
-
-        # Load A (row-major input → K-major swizzled SMEM)
-        gA_flat = cute.make_tensor(A_in.iterator, cute.make_layout(M * K))
-        gB_flat = cute.make_tensor(B_in.iterator, cute.make_layout(K * N))
-
-        for step in cutlass.range(M * K // 128, unroll_full=False):
-            smem_idx = tidx + step * 128
-            m = smem_idx % M
-            k = smem_idx // M
-            bufA_s0[smem_idx] = gA_flat[m * K + k]
-        for step in cutlass.range(K * N // 128, unroll_full=False):
-            idx = tidx + step * 128
-            bufB_s0[idx] = gB_flat[idx]
-        sync_threads()
-
-        # --- TMEM allocation ---
-        alloc_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
-        tmem = utils.TmemAllocator(
-            tmem_hold_ptr,
-            barrier_for_retrieve=alloc_bar,
-            allocator_warp_id=0,
-        )
-        tmem.allocate(512)
-        tmem.wait_for_alloc()
-        tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
-
-        rA = cute.make_rmem_tensor((self.K, ), BFloat16)
-        # Layout E A-operand pack: warp w lane l (l<16) → A^T row = w*16 + l, full K-row.
-        # Inactive lanes (l>=16) store zeros (warp-collective tcgen05.st requires all 32 lanes).
-        row_active = warp_idx * 16 + lane_idx  # only valid when lane_idx < 16
-        is_active = lane_idx < cutlass.Int32(16)
-        for j in cutlass.range_constexpr(self.K):
-            if is_active:
-                rA[j] = bufA_s0[row_active * self.K + j]
-            else:
-                rA[j] = BFloat16(0.0)
-
-        rA_val = rA.load()
-        rA_i32_val = reinterpret_cast(rA_val, BFloat16, self.K, Int32)
-        # Store K/2 dwords per active lane → K/2 TMEM cols per warp subpart
-        tcgen05_st_32x32b(self.K // 2, TMEM_OPA, rA_i32_val)
-        cute.arch.fence_view_async_tmem_store()
-
-        self.wg_sync_barrier.arrive_and_wait()
-
-        # Build SMEM descriptors (rank-2 vec_mode layout required)
-        desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
-        desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
-        tmem_a_base = TMEM_OPA
-
-        # Per-K-atom byte offsets are derived from the (unswizzled) outer layout
-        # so we transparently handle every K size:
-        #   K∈{16,32,64}        → A k_iter is single-mode, uniform stride
-        #   K≥128               → A k_iter is hierarchical e.g. (4,K/64):(16,4096)
-        #   B is always uniform stride=1024 elem
-        # Coord ((0,0), 0, ks, 0) into outer layout gives the linear elem offset
-        # of the ks-th MMA-K atom; * sizeof(elem) → byte offset to add to desc.
-        ELEM_BYTES_F16 = BFloat16.width // 8
-        b_outer = b_smem_layout.outer
-
-        # Issue WS SS MMA  (scale_out=0 → D = A*B, not accumulate)
-        if warp_idx == cutlass.Int32(0):
-            with elect_one():
-                for ks in cutlass.range_constexpr(K // 16):
-                    scale = 0 if ks == 0 else 1
-                    b_off = cute.crd2idx(((0, 0), 0, ks, 0), b_outer) * ELEM_BYTES_F16
-                    desc_b = desc_b_base + b_off
-                    tmem_a = tmem_a_base + ks * 8  # 8 TMEM cols per K-atom of 16 BF16
-                    tcgen05mma_ws_ts_f16(tmem_a, desc_b, TMEM_ACC, idesc, scale)
-                tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
-        mbarrier_wait(mbar_ptr, 0)
-        sync_threads()
-
-        # T2R
-        # Layout E (M=64, ws mode): 128 lanes, 32 columns
-        # ref: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-e
-        # .32x32b.x32 loads all 32 columns → 32 FP32 regs per thread
-        # Layout: warp0->(M0,N0), warp1->(M0,N1), warp2->(M1,N0), warp3->(M1,N1)
-        # for 64x64 Acc, each warp process 32x32, with 128 lanes in TMEM all used
-
-        vec_i32 = tcgen05_ld_32x32b(ACC_NUM_COLS, TMEM_ACC)
-        cute.arch.fence_view_async_tmem_load()
-
-        # =======DEBUG========
-        # # 1. reinterpret_cast to f32 (zero-cost bitcast)
-        # vec_f32 = reinterpret_cast(vec_i32, Int32, ACC_NUM_COLS, Float32)
-
-        # # 2. TensorSSA wrap → .to(BFloat16) (real CUDA core CVT)
-        # regs = TensorSSA(vec_f32, (ACC_NUM_COLS,), Float32)
-
-        # # Debug print: thread 0, first 4 register values
-        # if tidx == cutlass.Int32(0):
-        #     cute.printf("[T2R] tid=0, regs[0..3] = %f, %f, %f, %f",
-        #                 regs[0], regs[1], regs[2], regs[3])
-
-        # R2G via store_256b (4 × 256-bit stores per thread)
-        # Layout E C-out (column-major warp order):
-        #   warp0->(M0,N0), warp1->(M1,N0), warp2->(M0,N1), warp3->(M1,N1)
-        col_base = (warp_idx // 2) * ACC_NUM_COLS  # N0 or N1
-        out_row = (warp_idx % 2) * (M // 2) + lane_idx  # M0 or M1, full 32 lanes used for C
-        # 32 regs = 4 chunks of 8 × 32-bit each (256 bits)
-        base_addr = (C_out.iterator + out_row * N + col_base).toint()
-        for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
-            store_256b(base_addr + chunk * 32, subvec(vec_i32, chunk * 8, 8))
-
-        sync_threads()
-        tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr_f32, 512)
-
-    @cute.jit
-    def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
-        self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
-
-    def run(self, A_cpu, B_cpu):
-        M, N = self.M, self.N
-        A_gpu = A_cpu.cuda().to(torch.bfloat16).contiguous()
-        B_gpu = B_cpu.cuda().to(torch.bfloat16).contiguous()
-        C_gpu = torch.zeros(M, N, dtype=torch.float32, device="cuda")
-        stream = cutlass_torch.default_stream()
-        self._launch(from_dlpack(A_gpu), from_dlpack(B_gpu), from_dlpack(C_gpu), stream)
-        torch.cuda.synchronize()
-        return C_gpu.cpu()
-
-
-# =====================================================================
-# Test 5: tcgen05mma_ws_ss_tf32 with explicit collector_b_buffer/collector_op
+# Test 3: tcgen05mma_ws_ss_tf32 with explicit collector_b_buffer/collector_op
 # =====================================================================
 
 
@@ -800,30 +562,9 @@ def test_ws_ss_f16():
             assert rel < 0.02, f"FAIL N={N}, K={K}: rel={rel:.4f}"
             print(f"  PASSED (N={N}, K={K})")
 
-def test_ws_ts_f16():
-    print("\n=== Test 3: tcgen05mma_ws_ts_f16 (weight-stationary, TMEM A × SMEM B, f16) ===")
-    torch.manual_seed(42)
-    for N in [64, 128]:
-        for K in [64, 128]:
-            print(f"  --- N={N}, K={K} ---")
-            A = torch.randn(M_DIM, K)
-            B = torch.randn(K, N)
-            ref = torch.mm(A, B)
-            got = _WsTsF16Kernel(M_DIM, N, K).run(A, B)
-            err = (got - ref).abs()
-            rel = err.max().item() / (ref.abs().max().item() + 1e-8)
-            max_idx = err.argmax().item()
-            mi, mj = max_idx // N, max_idx % N
-            print(f"  got[0,:4]={got[0, :4].tolist()}")
-            print(f"  ref[0,:4]={ref[0, :4].tolist()}")
-            print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi, mj]:.6f} ref={ref[mi, mj]:.6f}")
-            assert rel < 0.02, f"FAIL N={N}, K={K}: rel={rel:.4f}"
-            print(f"  PASSED (N={N}, K={K})")
-
-
 def test_ws_ss_tf32_collector():
     """Explicit collector_b_buffer=B0, collector_op=DISCARD should match default."""
-    print("\n=== Test 5: tcgen05mma_ws_ss_tf32 + collector (B0::DISCARD) ===")
+    print("\n=== Test 2: tcgen05mma_ws_ss_tf32 + collector (B0::DISCARD) ===")
     torch.manual_seed(42)
     A = torch.randn(M_DIM, K_DIM_TF32)
     B = torch.randn(K_DIM_TF32, N_DIM)
@@ -844,5 +585,4 @@ if __name__ == "__main__":
     test_ws_ss_tf32()
     test_ws_ss_tf32_collector()
     test_ws_ss_f16()
-    # test_ws_ts_f16()
     print("\n=== All tests passed! ===")
