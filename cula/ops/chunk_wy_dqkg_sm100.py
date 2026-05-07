@@ -742,6 +742,7 @@ class ChunkKdaBwdWyDqkgFused:
 
         # ===================== SMEM layouts =====================
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
 
         # SS opA layout: do/vnew/dv [BT,BV]=[64,64] K-major
         vloop_opA_smem = sm100_utils.make_smem_layout_a(
@@ -853,6 +854,13 @@ class ChunkKdaBwdWyDqkgFused:
             1,
         )
 
+        dg_epi_smem_layout = sm100_utils.make_smem_layout_epi(
+            self.g_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK),
+            self.kloop_stage,
+        )
+
         # ===================== Cluster layout =====================
         cluster_layout = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
@@ -950,6 +958,14 @@ class ChunkKdaBwdWyDqkgFused:
             tma_load_op,
             q,
             q_epi_smem_no_stage,
+            (self.BT, self.BK),
+        )
+
+        dg_epi_smem_no_stage = cute.select(dg_epi_smem_layout, mode=[0, 1])
+        tma_atom_dg, tma_tensor_dg = cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            dg,
+            dg_epi_smem_no_stage,
             (self.BT, self.BK),
         )
 
@@ -1107,6 +1123,8 @@ class ChunkKdaBwdWyDqkgFused:
             tma_tensor_vnew,
             tma_atom_q,
             tma_tensor_q,
+            tma_atom_dg,
+            tma_tensor_dg,
             # SMEM layouts
             vloop_opA_smem,
             vloop_opB_smem,
@@ -1167,6 +1185,8 @@ class ChunkKdaBwdWyDqkgFused:
         tma_tensor_vnew: cute.Tensor,
         tma_atom_q: cute.CopyAtom,
         tma_tensor_q: cute.Tensor,
+        tma_atom_dg: cute.CopyAtom,
+        tma_tensor_dg: cute.Tensor,
         # SMEM layouts
         vloop_opA_smem: cute.ComposedLayout,
         vloop_opB_smem: cute.ComposedLayout,
@@ -2148,7 +2168,7 @@ class ChunkKdaBwdWyDqkgFused:
                         chunk_dg = cute.local_tile(rDg, (4,), (i,))
                         smem_store_f32x4_sw128(sG_raw_ptr, row, col_base, chunk_dg)
 
-                cute.arch.fence_acq_rel_cta()
+                cute.arch.fence_proxy("async.shared", space="cta")
                 pipeline_store_dg.producer_commit(store_dg_producer_state)
                 store_dg_producer_state.advance()
 
@@ -2871,32 +2891,51 @@ class ChunkKdaBwdWyDqkgFused:
                 pipeline_load_g.consumer_wait(load_g_store_consumer_state)
                 pipeline_store_dg.consumer_wait(store_dg_consumer_state)
 
-                store_lane_row = tidx >> Int32(4)          # 0..3
-                store_col_base = (tidx & Int32(15)) * Int32(8)  # 0,8,...,120
-                for row_quad in cutlass.range_constexpr(self.BT // 4):
-                    store_row = row_quad * 4 + store_lane_row
-                    if store_row < sub_seq_len:
-                        vals0 = smem_load_f32x4_sw128(sG_raw_ptr, store_row, store_col_base)
-                        vals1 = smem_load_f32x4_sw128(sG_raw_ptr, store_row, store_col_base + Int32(4))
-                        dg_store_rmem = cute.make_rmem_tensor((8,), Float32)
-                        dg_store_rmem[0] = vals0[0]
-                        dg_store_rmem[1] = vals0[1]
-                        dg_store_rmem[2] = vals0[2]
-                        dg_store_rmem[3] = vals0[3]
-                        dg_store_rmem[4] = vals1[0]
-                        dg_store_rmem[5] = vals1[1]
-                        dg_store_rmem[6] = vals1[2]
-                        dg_store_rmem[7] = vals1[3]
-                        dg_store_i32_vec = reinterpret_cast(
-                            dg_store_rmem.load(), Float32, 8, Int32
-                        )
-                        dg_base_addr = (
-                            dg_gmem.iterator
-                            + (tok_offset + tile_idx * self.BT + store_row) * H * K
-                            + head_idx * K
-                            + store_col_base
-                        ).toint()
-                        store_256b(dg_base_addr, dg_store_i32_vec)
+                tma_dg_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_dg)
+                tDGsDG, tDGgDG = self._epilog_partition_varlen(
+                    tma_atom_dg,
+                    tma_dg_v[None, None, (head_idx, Int32(0))],
+                    (self.BT, self.BK),
+                    sG_raw,
+                )
+                if sub_seq_len < self.BT:
+                    # Tail chunk, direct store
+                    store_lane_row = tidx >> Int32(4)          # 0..3
+                    store_col_base = (tidx & Int32(15)) * Int32(8)  # 0,8,...,120
+                    for row_quad in cutlass.range_constexpr(self.BT // 4):
+                        store_row = row_quad * 4 + store_lane_row
+                        if store_row < sub_seq_len:
+                            vals0 = smem_load_f32x4_sw128(sG_raw_ptr, store_row, store_col_base)
+                            vals1 = smem_load_f32x4_sw128(sG_raw_ptr, store_row, store_col_base + Int32(4))
+                            dg_store_rmem = cute.make_rmem_tensor((8,), Float32)
+                            dg_store_rmem[0] = vals0[0]
+                            dg_store_rmem[1] = vals0[1]
+                            dg_store_rmem[2] = vals0[2]
+                            dg_store_rmem[3] = vals0[3]
+                            dg_store_rmem[4] = vals1[0]
+                            dg_store_rmem[5] = vals1[1]
+                            dg_store_rmem[6] = vals1[2]
+                            dg_store_rmem[7] = vals1[3]
+                            dg_store_i32_vec = reinterpret_cast(
+                                dg_store_rmem.load(), Float32, 8, Int32
+                            )
+                            dg_base_addr = (
+                                dg_gmem.iterator
+                                + (tok_offset + tile_idx * self.BT + store_row) * H * K
+                                + head_idx * K
+                                + store_col_base
+                            ).toint()
+                            store_256b(dg_base_addr, dg_store_i32_vec)
+                else:
+                    # Non-tail chunk, TMA store
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.copy(
+                        tma_atom_dg,
+                        tDGsDG[(None, 0)], # hardcode stage to 0 because kloop_stage is 1
+                        tDGgDG[(None, tile_idx, 0)],
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
 
                 pipeline_store_dg.consumer_release(store_dg_consumer_state)
                 store_dg_consumer_state.advance()
