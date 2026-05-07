@@ -77,6 +77,7 @@ TMEM_FLEX_OFF = 224  # [224,256) 32 cols  dvb time-shared
 TMEM_A_BF16_OFF = 256  # [256,272) 16 cols  A_bf16 TS opA (persistent)
 TMEM_DKGB_ACC_OFF = 272 # [272,336) 64 cols, dkgb fp32 acc
 TMEM_DA2_ACC_OFF = 336  # [336,368) 32 cols  dA fp32 acc, used for dA=dA@A and dA=A@dA
+TMEM_DQ_SCALED_OFF = 368 # [368,432) 64 cols  dq_scaled (stored for dg)
 TMEM_TOTAL = 512
 
 # Instruction descriptor for M=64, N=64, BF16, dense, TransposeB=1
@@ -1948,11 +1949,13 @@ class ChunkKdaBwdWyDqkgFused:
                 rDq = cute.make_rmem_tensor((bk_num_cols_per_wg,), Float32)
                 rDq.store(dq_f32_val * rG_exp_val * Float32(self.scale))
 
-                # TODO: store to smem first to reduce register usage
                 dq_f32_val_store = rDq.load()
                 dq_i32_vec = reinterpret_cast(
                     dq_f32_val_store, Float32, bk_num_cols_per_wg, Int32
                 )
+                # store to TMEM first to reduce register usage
+                tcgen05_st_32x32b(bk_num_cols_per_wg, TMEM_DQ_SCALED_OFF + wg_idx * bk_num_cols_per_wg, dq_i32_vec)
+                cute.arch.fence_view_async_tmem_store()
                 dq_base_addr = (
                     dq_gmem.iterator
                     + (tok_offset + tile_idx * self.BT + row) * H * K
@@ -2149,7 +2152,11 @@ class ChunkKdaBwdWyDqkgFused:
                         rQ[i * 8 + 7] = vals[7]
                 else:
                     rQ.fill(BFloat16(0.0))
-                rDg.store(rQ.load().to(Float32) * dq_f32_val_store + rDg.load() - rKdk.load())
+                dq_scaled_i32 = tcgen05_ld_32x32b(bk_num_cols_per_wg, TMEM_DQ_SCALED_OFF + wg_idx * bk_num_cols_per_wg)
+                cute.arch.fence_view_async_tmem_load()
+                dq_scaled_f32 = reinterpret_cast(dq_scaled_i32, Int32, bk_num_cols_per_wg, Float32)
+                dq_scaled_f32_val = TensorSSA(dq_scaled_f32, (bk_num_cols_per_wg,), Float32)
+                rDg.store(rQ.load().to(Float32) * dq_scaled_f32_val + rDg.load() - rKdk.load())
 
                 self.cuda_wg_sync_barrier.arrive_and_wait()
                 # dg = dg2 + m_last * dgk, GMEM store dg
