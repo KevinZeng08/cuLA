@@ -178,6 +178,18 @@ def check_determinism(H=4, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYP
         assert torch.equal(dA_out, ref_dA), f"dA mismatch at iter {i}"
         # NOTE: for db, kernel uses atomic add which can cause non-determinism, so we use a looser check here
         torch.testing.assert_close(db_out, ref_db, rtol=1e-5, atol=1e-5), f"db mismatch at iter {i}"
+        assert torch.isnan(dq_out).sum() == 0, f"dq contains NaNs at iter {i}"
+        assert torch.isnan(dk_out).sum() == 0, f"dk contains NaNs at iter {i}"
+        assert torch.isnan(dv_out).sum() == 0, f"dv contains NaNs at iter {i}"
+        assert torch.isnan(db_out).sum() == 0, f"db contains NaNs at iter {i}"
+        assert torch.isnan(dg_out).sum() == 0, f"dg contains NaNs at iter {i}"
+        assert torch.isnan(dA_out).sum() == 0, f"dA contains NaNs at iter {i}"
+        assert torch.isfinite(dq_out).all(), f"dq contains infs at iter {i}"
+        assert torch.isfinite(dk_out).all(), f"dk contains infs at iter {i}"
+        assert torch.isfinite(dv_out).all(), f"dv contains infs at iter {i}"
+        assert torch.isfinite(db_out).all(), f"db contains infs at iter {i}"
+        assert torch.isfinite(dg_out).all(), f"dg contains infs at iter {i}"
+        assert torch.isfinite(dA_out).all(), f"dA contains infs at iter {i}"
     return True
 
 
