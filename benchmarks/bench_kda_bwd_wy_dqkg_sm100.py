@@ -151,8 +151,10 @@ def run_cutedsl(inputs: dict):
         chunk_indices=inputs["chunk_indices"],
     )
 
-def check_determinism(H=4, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYPE):
+def check_determinism(H=4, HV=None, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYPE):
     """Verify deterministic outputs across repeated runs."""
+    if HV is None:
+        HV = H
     torch.manual_seed(42)
     seq_lens = generate_balanced_seqlens(total_T, num_seqs)
     cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=DEVICE)
@@ -162,6 +164,7 @@ def check_determinism(H=4, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYP
         H=H,
         K=K,
         V=V,
+        HV=HV,
         chunk_size=BT,
         device=DEVICE,
         seed=SEED,
@@ -196,9 +199,11 @@ def check_determinism(H=4, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYP
 # ============================================================
 # Fixed-length benchmark
 # ============================================================
-def bench_fixed(configs, H: int):
+def bench_fixed(configs, H: int, HV: int | None = None):
+    if HV is None:
+        HV = H
     print("\n" + "=" * 120)
-    print(f" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton  (H={H}, K={K}, V={V}, BT={BT})")
+    print(f" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton  (H={H}, HV={HV}, K={K}, V={V}, BT={BT})")
     print("=" * 120)
     results = []
 
@@ -215,6 +220,7 @@ def bench_fixed(configs, H: int):
             H=H,
             K=K,
             V=V,
+            HV=HV,
             chunk_size=BT,
             device=DEVICE,
             seed=SEED,
@@ -256,9 +262,11 @@ def bench_fixed(configs, H: int):
 # ============================================================
 # Varlen benchmark
 # ============================================================
-def bench_varlen(configs, H: int):
+def bench_varlen(configs, H: int, HV: int | None = None):
+    if HV is None:
+        HV = H
     print("\n" + "=" * 120)
-    print(f" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton  (H={H}, K={K}, V={V}, BT={BT})")
+    print(f" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton  (H={H}, HV={HV}, K={K}, V={V}, BT={BT})")
     print("=" * 120)
     results = []
 
@@ -275,6 +283,7 @@ def bench_varlen(configs, H: int):
             H=H,
             K=K,
             V=V,
+            HV=HV,
             chunk_size=BT,
             device=DEVICE,
             seed=SEED,
@@ -396,6 +405,12 @@ def main():
         default=[H_DEFAULT],
         help=f"Head counts to benchmark (default: [{H_DEFAULT}])",
     )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help="Number of value heads HV (default: same as H, i.e. no GVA). Must be a multiple of H.",
+    )
     parser.add_argument("--ncu", action="store_true", help="NCU profiling mode: warmup=1, iters=1")
     args = parser.parse_args()
 
@@ -430,15 +445,16 @@ def main():
     )
 
     for H in args.heads:
-        check_determinism(H=H, iters=10000)
+        HV = args.hv if args.hv is not None else H
+        check_determinism(H=H, HV=HV, iters=10000)
 
         fixed_res, varlen_res = [], []
 
         if args.mode in ("fixed", "both"):
-            fixed_res = bench_fixed(fixed_configs, H)
+            fixed_res = bench_fixed(fixed_configs, H, HV)
 
         if args.mode in ("varlen", "both"):
-            varlen_res = bench_varlen(varlen_configs, H)
+            varlen_res = bench_varlen(varlen_configs, H, HV)
 
         print_report(fixed_res, varlen_res, H)
 

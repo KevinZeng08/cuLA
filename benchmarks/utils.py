@@ -352,6 +352,7 @@ def prepare_bwd_wy_dqkg_fused_inputs(
     H: int,
     K: int,
     V: int,
+    HV: int | None = None,
     chunk_size: int = CHUNK_SIZE,
     device: torch.device | str = "cuda",
     seed: int = SEED,
@@ -364,9 +365,14 @@ def prepare_bwd_wy_dqkg_fused_inputs(
     chunk_kda_bwd_wy_dqkg_fused kernels.  Follows the same flattening convention
     used in other prepare_* helpers (B=1 with cu_seqlens for varlen mode).
 
+    HV: number of value heads (default: H). Set HV > H for GVA (grouped value attention).
+    q/k always have H heads; all other tensors use HV heads.
+
     Returns a dict with keys used directly by ``run_fla_triton`` and ``run_cutedsl``
     in ``bench_bwd_wy_dqkg_fused.py``.
     """
+    if HV is None:
+        HV = H
     BT = chunk_size
     scale = K**-0.5
 
@@ -375,22 +381,22 @@ def prepare_bwd_wy_dqkg_fused_inputs(
     # ---- primary token-indexed tensors ----
     q = torch.randn(B, T, H, K, dtype=dtype, device=device)
     k = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    g_raw = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid()
+    v = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    g_raw = torch.randn(B, T, HV, K, dtype=dtype, device=device)
+    beta = torch.randn(B, T, HV, dtype=torch.float, device=device).sigmoid()
 
     # l2norm q, k
     q, _ = l2norm_fwd(q)
     k, _ = l2norm_fwd(k)
 
     # gate preprocessing
-    A_log = torch.randn(H, dtype=torch.float, device=device)
-    dt_bias = torch.randn(H * K, dtype=torch.float, device=device)
+    A_log = torch.randn(HV, dtype=torch.float, device=device)
+    dt_bias = torch.randn(HV * K, dtype=torch.float, device=device)
 
-    v_new = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    do = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    dv = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+    v_new = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    do = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    dv = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    A = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
 
     # ---- chunk-indexed state tensors ----
     if cu_seqlens is not None:
@@ -401,13 +407,14 @@ def prepare_bwd_wy_dqkg_fused_inputs(
         NT = (B * T + BT - 1) // BT
         chunk_indices = None
 
-    # h/dh: both FLA Triton and CuTe DSL use bf16 [B, NT, H, K, V]
-    h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-    dh = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
+    # h/dh: both FLA Triton and CuTe DSL use bf16 [B, NT, HV, K, V]
+    h = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+    dh = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
 
     # flatten to batch_size=1 for cu_seqlens compatibility
     if B != 1:
-        q, k, v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g_raw, beta))
+        q, k = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k))
+        v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (v, g_raw, beta))
         v_new, do, dv, A = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (v_new, do, dv, A))
         h, dh = map(lambda x: rearrange(x, "b nt ... -> 1 (b nt) ..."), (h, dh))
 

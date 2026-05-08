@@ -504,14 +504,14 @@ class ChunkKdaBwdWyDqkgFused:
         hardware_info = cutlass.utils.HardwareInfo()
         self.num_sm = hardware_info.get_device_multiprocessor_count()
 
-    def _compute_grid(self, B, T, H, total_nt=None):
+    def _compute_grid(self, B, T, HV, total_nt=None):
         """Compute grid dimensions for persistent kernel launch.
 
         Grid: (min(num_sm * min_occupancy, total_tiles), 1, 1)
         Each CTA handles multiple tiles via stride-by-gridDim.x loop.
         """
         assert total_nt is not None
-        total_tiles = total_nt * H
+        total_tiles = total_nt * HV
         grid_x = cutlass.min(Int32(self.num_sm * self.min_occupancy), total_tiles)
         return (grid_x, Int32(1), Int32(1))
 
@@ -521,26 +521,26 @@ class ChunkKdaBwdWyDqkgFused:
         # ── Inputs ──
         q_in: cute.Tensor,  # [B, T, H, K] bf16
         k_in: cute.Tensor,  # [B, T, H, K] bf16
-        v_in: cute.Tensor,  # [B, T, H, V] bf16
-        v_new_in: cute.Tensor,  # [B, T, H, V] bf16
-        g_in: cute.Tensor,  # [B, T, H, K] fp32
-        beta_in: cute.Tensor,  # [B, T, H]    fp32
-        A_in: cute.Tensor,  # [B, T, H, BT] bf16
-        h_in: cute.Tensor,  # [B, NT, H, K, V] bf16
-        do_in: cute.Tensor,  # [B, T, H, V] bf16
-        dh_in: cute.Tensor,  # [B, NT, H, K, V] bf16
-        dv_in: cute.Tensor,  # [B, T, H, V] bf16
+        v_in: cute.Tensor,  # [B, T, HV, V] bf16
+        v_new_in: cute.Tensor,  # [B, T, HV, V] bf16
+        g_in: cute.Tensor,  # [B, T, HV, K] fp32
+        beta_in: cute.Tensor,  # [B, T, HV]   fp32
+        A_in: cute.Tensor,  # [B, T, HV, BT] bf16
+        h_in: cute.Tensor,  # [B, NT, HV, K, V] bf16
+        do_in: cute.Tensor,  # [B, T, HV, V] bf16
+        dh_in: cute.Tensor,  # [B, NT, HV, K, V] bf16
+        dv_in: cute.Tensor,  # [B, T, HV, V] bf16
         # ── Outputs ──
-        dq_in: cute.Tensor,  # [B, T, H, K] fp32
-        dk_in: cute.Tensor,  # [B, T, H, K] fp32
-        dv2_in: cute.Tensor,  # [B, T, H, V] bf16
-        dg_in: cute.Tensor,  # [B, T, H, K] fp32
-        db_in: cute.Tensor,  # [B, T, H]    fp32
-        dA_in: cute.Tensor,  # [B, T, H, BT] fp32
+        dq_in: cute.Tensor,  # [B, T, HV, K] fp32
+        dk_in: cute.Tensor,  # [B, T, HV, K] fp32
+        dv2_in: cute.Tensor,  # [B, T, HV, V] bf16
+        dg_in: cute.Tensor,  # [B, T, HV, K] fp32
+        db_in: cute.Tensor,  # [B, T, HV]    fp32
+        dA_in: cute.Tensor,  # [B, T, HV, BT] fp32
         # ── Metadata ──
         cu_seqlens_in: cute.Tensor,  # [N+1] int32
         chunk_indices_in: cute.Tensor,  # [NT, 2] int32
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],  # (B, T, H, HV, K, V)
         total_nt: Int32,
         stream,
     ):
@@ -565,7 +565,7 @@ class ChunkKdaBwdWyDqkgFused:
         cu_seqlens_ptr = cu_seqlens_in.iterator
         chunk_indices_ptr = chunk_indices_in.iterator
 
-        B, T, H, K, V = problem_size
+        B, T, H, HV, K, V = problem_size
         BT = self.BT
         BK = self.BK
         BV = self.BV
@@ -583,10 +583,10 @@ class ChunkKdaBwdWyDqkgFused:
         q = cute.make_tensor(q_ptr, qk_layout)
         k = cute.make_tensor(k_ptr, qk_layout)
 
-        # v, v_new, do, dv, dv2: (T, V, (H, data_B)) bf16
+        # v, v_new, do, dv, dv2: (T, V, (HV, data_B)) bf16
         tv_layout = cute.make_layout(
-            (T, V, (H, data_B)),
-            stride=(H * V, 1, (V, T * H * V)),
+            (T, V, (HV, data_B)),
+            stride=(HV * V, 1, (V, T * HV * V)),
         )
         v = cute.make_tensor(v_ptr, tv_layout)
         v_new = cute.make_tensor(v_new_ptr, tv_layout)
@@ -594,68 +594,68 @@ class ChunkKdaBwdWyDqkgFused:
         dv = cute.make_tensor(dv_ptr, tv_layout)
         dv2 = cute.make_tensor(dv2_ptr, tv_layout)
 
-        # g: (T, K, (H, data_B)) fp32
+        # g: (T, K, (HV, data_B)) fp32
         g_layout = cute.make_layout(
-            (T, K, (H, data_B)),
-            stride=(H * K, 1, (K, T * H * K)),
+            (T, K, (HV, data_B)),
+            stride=(HV * K, 1, (K, T * HV * K)),
         )
         g = cute.make_tensor(g_ptr, g_layout)
 
-        # beta: (T, (H, data_B)) fp32
+        # beta: (T, (HV, data_B)) fp32
         beta_layout = cute.make_layout(
-            (T, (H, data_B)),
-            stride=(H, (1, T * H)),
+            (T, (HV, data_B)),
+            stride=(HV, (1, T * HV)),
         )
         beta = cute.make_tensor(beta_ptr, beta_layout)
 
-        # A: (T, BT, (H, data_B)) bf16
+        # A: (T, BT, (HV, data_B)) bf16
         a_layout = cute.make_layout(
-            (T, BT, (H, data_B)),
-            stride=(H * BT, 1, (BT, T * H * BT)),
+            (T, BT, (HV, data_B)),
+            stride=(HV * BT, 1, (BT, T * HV * BT)),
         )
         A = cute.make_tensor(A_ptr, a_layout)
         # NOTE: for A as operand A, A is loaded as transposed view to do MMA
         a_t_layout = cute.make_layout(
-            (BT, T, (H, data_B)),
-            stride=(1, H * BT, (BT, T * H * BT)),
+            (BT, T, (HV, data_B)),
+            stride=(1, HV * BT, (BT, T * HV * BT)),
         )
         A_T = cute.make_tensor(A_ptr, a_t_layout)
 
-        # dq, dk: (T, K, (H, data_B)) fp32
+        # dq, dk: (T, K, (HV, data_B)) fp32
         dqk_layout = cute.make_layout(
-            (T, K, (H, data_B)),
-            stride=(H * K, 1, (K, T * H * K)),
+            (T, K, (HV, data_B)),
+            stride=(HV * K, 1, (K, T * HV * K)),
         )
         dq = cute.make_tensor(dq_ptr, dqk_layout)
         dk = cute.make_tensor(dk_ptr, dqk_layout)
 
-        # dg: (T, K, (H, data_B)) fp32
+        # dg: (T, K, (HV, data_B)) fp32
         dg = cute.make_tensor(dg_ptr, dqk_layout)
 
-        # db: (T, (H, data_B)) fp32
+        # db: (T, (HV, data_B)) fp32
         db = cute.make_tensor(db_ptr, beta_layout)
 
-        # dA: (T, BT, (H, data_B)) fp32
+        # dA: (T, BT, (HV, data_B)) fp32
         dA_layout = cute.make_layout(
-            (T, BT, (H, data_B)),
-            stride=(H * BT, 1, (BT, T * H * BT)),
+            (T, BT, (HV, data_B)),
+            stride=(HV * BT, 1, (BT, T * HV * BT)),
         )
         dA_out = cute.make_tensor(dA_ptr, dA_layout)
 
         h_nt_total = NT
 
-        # h row-major: (K, V, (h_nt_total, H)) as operand B
+        # h row-major: (K, V, (h_nt_total, HV)) as operand B
         h_layout = cute.make_layout(
-            (K, V, (h_nt_total, H)),
-            stride=(V, 1, (H * K * V, K * V)),
+            (K, V, (h_nt_total, HV)),
+            stride=(V, 1, (HV * K * V, K * V)),
         )
         h = cute.make_tensor(h_ptr, h_layout)
         dh = cute.make_tensor(dh_ptr, h_layout)
 
         # Transposed views for V-loop TMA (data loaded as MMA B-operands):
         vt_layout = cute.make_layout(
-            (V, T, (data_B, H)),
-            stride=(1, H * V, (T * H * V, V)),
+            (V, T, (data_B, HV)),
+            stride=(1, HV * V, (T * HV * V, V)),
         )
         v_T = cute.make_tensor(v_ptr, vt_layout)
 
@@ -1092,7 +1092,7 @@ class ChunkKdaBwdWyDqkgFused:
         chunk_indices = cute.make_tensor(chunk_indices_ptr, cute.make_layout((total_nt, 2), stride=(2, 1)))
 
         # ===================== Grid =====================
-        grid = self._compute_grid(B, T, H, total_nt=total_nt)
+        grid = self._compute_grid(B, T, HV, total_nt=total_nt)
 
         # ===================== Launch kernel =====================
         self.kernel(
@@ -1217,9 +1217,9 @@ class ChunkKdaBwdWyDqkgFused:
         # Metadata
         cu_seqlens: cute.Tensor,
         chunk_indices: cute.Tensor,
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],  # (B, T, H, HV, K, V)
     ):
-        B, T, H, K, V = problem_size
+        B, T, H, HV, K, V = problem_size
         BT = self.BT
         BK, BV = self.BK, self.BV
 
@@ -1230,7 +1230,7 @@ class ChunkKdaBwdWyDqkgFused:
         thread_idx     = cute.arch.thread_idx()[0]
         lane_idx = thread_idx % 32
 
-        total_work_units = chunk_indices.layout.shape[0] * H
+        total_work_units = chunk_indices.layout.shape[0] * HV
         num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
         
         num_cuda_warps = len(self.cuda_warp_ids)
@@ -1787,8 +1787,10 @@ class ChunkKdaBwdWyDqkgFused:
             vloop_stage_idx = 0
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
-                i_t = work_idx // H  # chunk index (global)
-                head_idx = work_idx % H  # head index
+                G = HV // H
+                i_t = work_idx // HV  # chunk index (global)
+                i_hv = work_idx % HV  # value-head index
+                i_h = i_hv // G       # q/k head index
                 # Decode chunk_indices
                 batch_idx = chunk_indices[(i_t, 0)]
                 tile_idx = chunk_indices[(i_t, 1)]
@@ -1901,8 +1903,8 @@ class ChunkKdaBwdWyDqkgFused:
 
                     base_addr = (
                         dv2_gmem.iterator
-                        + (tok_offset + tile_idx * self.BT + row) * H * V
-                        + head_idx * V
+                        + (tok_offset + tile_idx * self.BT + row) * HV * V
+                        + i_hv * V
                         + v_iter * self.BV
                         + bv_col_base
                     ).toint()
@@ -1958,8 +1960,8 @@ class ChunkKdaBwdWyDqkgFused:
                 cute.arch.fence_view_async_tmem_store()
                 dq_base_addr = (
                     dq_gmem.iterator
-                    + (tok_offset + tile_idx * self.BT + row) * H * K
-                    + head_idx * K
+                    + (tok_offset + tile_idx * self.BT + row) * HV * K
+                    + i_hv * K
                     + bk_col_base
                 ).toint()
                 if row < sub_seq_len:
@@ -2062,7 +2064,7 @@ class ChunkKdaBwdWyDqkgFused:
                 self.cuda_wg_sync_barrier.arrive_and_wait()
                 # store db to GMEM
                 if local_tidx < sub_seq_len:
-                    db_gmem[(tok_offset + tile_idx * self.BT + local_tidx, (head_idx, Int32(0)))] = sDb[(local_tidx,)]
+                    db_gmem[(tok_offset + tile_idx * self.BT + local_tidx, (i_hv, Int32(0)))] = sDb[(local_tidx,)]
 
                 # dk = dk * exp2(gn[None, :] - g)
                 pipeline_mma_dk.consumer_wait(mma_dk_consumer_state)
@@ -2103,8 +2105,8 @@ class ChunkKdaBwdWyDqkgFused:
                 # 8 fp32 store each time for store_256b
                 dk_base_addr = (
                     dk_gmem.iterator
-                    + (tok_offset + tile_idx * self.BT + row) * H * K
-                    + head_idx * K
+                    + (tok_offset + tile_idx * self.BT + row) * HV * K
+                    + i_hv * K
                     + bk_col_base
                 ).toint()
                 if row < sub_seq_len:
@@ -2283,8 +2285,8 @@ class ChunkKdaBwdWyDqkgFused:
                 num_stores_dA = bt_num_cols_per_wg // 8
                 dA_base_addr = (
                     dA_gmem.iterator
-                    + (tok_offset + tile_idx * self.BT + row) * H * BT
-                    + head_idx * BT
+                    + (tok_offset + tile_idx * self.BT + row) * HV * BT
+                    + i_hv * BT
                     + bt_col_base
                 ).toint()
                 if row < sub_seq_len:
@@ -2330,8 +2332,10 @@ class ChunkKdaBwdWyDqkgFused:
             vloop_stage_idx = 0
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
-                i_t = work_idx // H  # chunk index (global)
-                head_idx = work_idx % H  # head index
+                G = HV // H
+                i_t = work_idx // HV  # chunk index (global)
+                i_hv = work_idx % HV  # value-head index
+                i_h = i_hv // G       # q/k head index
 
                 # Decode chunk_indices
                 batch_idx = chunk_indices[(i_t, 0)]
@@ -2349,7 +2353,7 @@ class ChunkKdaBwdWyDqkgFused:
                     self.dvb_tiler, # [BT, BV, BT]
                     dvb_tiled_mma,
                     Int32(0),
-                    head_idx,
+                    i_hv,
                 )
                 pipeline_load_A.producer_acquire(load_A_producer_state)
                 cute.copy(
@@ -2369,7 +2373,7 @@ class ChunkKdaBwdWyDqkgFused:
                         sH,
                         self.vloop_gemm_tiler, # [BT, BK, BV]
                         vloop_tiled_mma,
-                        head_idx, i_t
+                        i_hv, i_t
                     )
                     pipeline_load_h.producer_acquire(load_h_producer_state)
                     cute.copy(
@@ -2387,7 +2391,7 @@ class ChunkKdaBwdWyDqkgFused:
                         sDh,
                         self.vloop_gemm_tiler, # [BT, BK, BV]
                         vloop_tiled_mma,
-                        head_idx, i_t
+                        i_hv, i_t
                     )
                     pipeline_load_dh.producer_acquire(load_dh_producer_state)
                     cute.copy(
@@ -2405,7 +2409,7 @@ class ChunkKdaBwdWyDqkgFused:
                         sDo,
                         self.vloop_gemm_tiler, # [BT, BK, BV]
                         vloop_tiled_mma,
-                        Int32(0), head_idx,
+                        Int32(0), i_hv,
                     )
                     pipeline_load_do.producer_acquire(load_do_producer_state)
                     cute.copy(
@@ -2423,7 +2427,7 @@ class ChunkKdaBwdWyDqkgFused:
                         sDv,
                         self.vloop_gemm_tiler, # [BT, BK, BV]
                         vloop_tiled_mma,
-                        Int32(0), head_idx,
+                        Int32(0), i_hv,
                     )
                     pipeline_load_dv.producer_acquire(load_dv_producer_state)
                     cute.copy(
@@ -2441,7 +2445,7 @@ class ChunkKdaBwdWyDqkgFused:
                         sV,
                         self.dA_vloop_tiler, # [BT, BT, BV]
                         dA_vloop_tiled_mma,
-                        Int32(0), head_idx,
+                        Int32(0), i_hv,
                     )
                     pipeline_load_v.producer_acquire(load_v_producer_state)
                     cute.copy(
@@ -2460,7 +2464,7 @@ class ChunkKdaBwdWyDqkgFused:
                         sVnew,
                         self.vloop_gemm_tiler, # [BT, BK, BV]
                         vloop_tiled_mma,
-                        Int32(0), head_idx,
+                        Int32(0), i_hv,
                     )
                     pipeline_load_vnew.producer_acquire(load_vnew_producer_state)
                     cute.copy(
@@ -2477,7 +2481,7 @@ class ChunkKdaBwdWyDqkgFused:
                 tma_g_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_g)
                 tGsG, tGgG = self._epilog_partition_varlen(
                     tma_atom_g,
-                    tma_g_v[None, None, (head_idx, Int32(0))],
+                    tma_g_v[None, None, (i_hv, Int32(0))],
                     (self.BT, self.BK),
                     sG_raw,
                 )
@@ -2494,7 +2498,7 @@ class ChunkKdaBwdWyDqkgFused:
                 tma_k_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_k)
                 tKsK, tKgK = self._epilog_partition_varlen(
                     tma_atom_k,
-                    tma_k_v[None, None, (head_idx, Int32(0))],
+                    tma_k_v[None, None, (i_h, Int32(0))],
                     (self.BT, self.BK),
                     sK_raw,
                 )
@@ -2510,7 +2514,7 @@ class ChunkKdaBwdWyDqkgFused:
                 tma_q_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_q)
                 tQsQ, tQgQ = self._epilog_partition_varlen(
                     tma_atom_q,
-                    tma_q_v[None, None, (head_idx, Int32(0))],
+                    tma_q_v[None, None, (i_h, Int32(0))],
                     (self.BT, self.BK),
                     sQ_raw,
                 )
@@ -2591,8 +2595,10 @@ class ChunkKdaBwdWyDqkgFused:
             mma_vloop_phase = 0
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
-                i_t = work_idx // H  # chunk index (global)
-                head_idx = work_idx % H  # head index
+                G = HV // H
+                i_t = work_idx // HV  # chunk index (global)
+                i_hv = work_idx % HV  # value-head index (unused in MMA warp)
+                i_h = i_hv // G       # q/k head index (unused in MMA warp)
 
                 # Decode chunk_indices
                 batch_idx = chunk_indices[(i_t, 0)]
@@ -2875,8 +2881,10 @@ class ChunkKdaBwdWyDqkgFused:
 
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
-                i_t = work_idx // H  # chunk index (global)
-                head_idx = work_idx % H  # head index
+                G = HV // H
+                i_t = work_idx // HV  # chunk index (global)
+                i_hv = work_idx % HV  # value-head index
+                i_h = i_hv // G       # q/k head index (unused in aux warp)
 
                 # Decode chunk_indices
                 batch_idx = chunk_indices[(i_t, 0)]
@@ -2888,7 +2896,7 @@ class ChunkKdaBwdWyDqkgFused:
                 pipeline_load_beta.producer_acquire(load_beta_producer_state)
                 beta_f32 = Float32(0.0)
                 if tidx < sub_seq_len:
-                    beta_f32 = Float32(beta_gmem[(tok_offset + tile_idx * self.BT + tidx, (head_idx, Int32(0)))])
+                    beta_f32 = Float32(beta_gmem[(tok_offset + tile_idx * self.BT + tidx, (i_hv, Int32(0)))])
                 sBeta[(tidx, )] = beta_f32
 
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -2901,7 +2909,7 @@ class ChunkKdaBwdWyDqkgFused:
                 tma_dg_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_dg)
                 tDGsDG, tDGgDG = self._epilog_partition_varlen(
                     tma_atom_dg,
-                    tma_dg_v[None, None, (head_idx, Int32(0))],
+                    tma_dg_v[None, None, (i_hv, Int32(0))],
                     (self.BT, self.BK),
                     sG_raw,
                 )
@@ -2928,8 +2936,8 @@ class ChunkKdaBwdWyDqkgFused:
                             )
                             dg_base_addr = (
                                 dg_gmem.iterator
-                                + (tok_offset + tile_idx * self.BT + store_row) * H * K
-                                + head_idx * K
+                                + (tok_offset + tile_idx * self.BT + store_row) * HV * K
+                                + i_hv * K
                                 + store_col_base
                             ).toint()
                             store_256b(dg_base_addr, dg_store_i32_vec)
@@ -3036,7 +3044,7 @@ class ChunkKdaBwdWyDqkgFused:
 _bwd_wy_kernel_cache: dict = {}
 
 
-def _compile_bwd_wy_variant(H, K, V, scale, chunk_size, beta_dtype, use_fast_math):
+def _compile_bwd_wy_variant(H, HV, K, V, scale, chunk_size, beta_dtype, use_fast_math):
     """Compile one ChunkKdaBwdWyDqkgFused kernel variant.
 
     Uses make_fake_compact_tensor and make_fake_stream for compilation with
@@ -3063,23 +3071,23 @@ def _compile_bwd_wy_variant(H, K, V, scale, chunk_size, beta_dtype, use_fast_mat
     # varlen: data tensors are [1, T_total, H, ...]
     q_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
     k_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-    v_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
-    vnew_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
-    g_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-    beta_fake = make_fake_compact_tensor(beta_dtype, (1, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
-    A_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, BT), stride_order=(3, 2, 1, 0), assumed_align=128)
-    do_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
-    dv_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+    v_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, HV, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+    vnew_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, HV, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+    g_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, HV, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    beta_fake = make_fake_compact_tensor(beta_dtype, (1, sym_b, HV), stride_order=(2, 1, 0), assumed_align=128)
+    A_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, HV, BT), stride_order=(3, 2, 1, 0), assumed_align=128)
+    do_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, HV, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+    dv_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, HV, V), stride_order=(3, 2, 1, 0), assumed_align=128)
 
-    dq_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-    dk_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-    dv2_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
-    dg_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-    db_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
-    dA_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H, BT), stride_order=(3, 2, 1, 0), assumed_align=128)
+    dq_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, HV, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    dk_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, HV, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    dv2_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, HV, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+    dg_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, HV, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    db_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, HV), stride_order=(2, 1, 0), assumed_align=128)
+    dA_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, HV, BT), stride_order=(3, 2, 1, 0), assumed_align=128)
 
-    h_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_nt, H, K, V), stride_order=(4, 3, 2, 1, 0), assumed_align=128)
-    dh_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_nt, H, K, V), stride_order=(4, 3, 2, 1, 0), assumed_align=128)
+    h_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_nt, HV, K, V), stride_order=(4, 3, 2, 1, 0), assumed_align=128)
+    dh_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_nt, HV, K, V), stride_order=(4, 3, 2, 1, 0), assumed_align=128)
 
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=128)
     ci_fake = make_fake_compact_tensor(cutlass.Int32, (sym_ci, 2), stride_order=(1, 0), assumed_align=128)
@@ -3109,7 +3117,7 @@ def _compile_bwd_wy_variant(H, K, V, scale, chunk_size, beta_dtype, use_fast_mat
         # Metadata
         cu_fake,
         ci_fake,
-        (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
+        (Int32(1), Int32(1), Int32(H), Int32(HV), Int32(K), Int32(V)),
         Int32(1),  # total_nt dummy
         stream_fake,
         options=COMPILE_OPTIONS,
@@ -3117,15 +3125,16 @@ def _compile_bwd_wy_variant(H, K, V, scale, chunk_size, beta_dtype, use_fast_mat
     return compiled_fn
 
 
-def _get_compiled_bwd_wy(H, K, V, scale, chunk_size, beta_dtype):
+def _get_compiled_bwd_wy(H, HV, K, V, scale, chunk_size, beta_dtype):
     """Get a compiled ChunkKdaBwdWyDqkgFused kernel with on-demand (lazy) compilation.
 
-    Cache key: (H, K, V, scale, chunk_size, beta_dtype, USE_FAST_MATH)
+    Cache key: (H, HV, K, V, scale, chunk_size, beta_dtype, USE_FAST_MATH)
     """
-    key = (H, K, V, scale, chunk_size, beta_dtype, USE_FAST_MATH)
+    key = (H, HV, K, V, scale, chunk_size, beta_dtype, USE_FAST_MATH)
     if key not in _bwd_wy_kernel_cache:
         _bwd_wy_kernel_cache[key] = _compile_bwd_wy_variant(
             H,
+            HV,
             K,
             V,
             scale,
@@ -3172,6 +3181,7 @@ def chunk_kda_bwd_wy_dqkg_fused(
     """
     B, T, H, K = q.shape
     V = v.shape[3]
+    HV = v.shape[2]
     BT = chunk_size
     beta_dtype = beta.dtype
     device = q.device
@@ -3190,18 +3200,19 @@ def chunk_kda_bwd_wy_dqkg_fused(
     T_total = B * T
     num_seqs = cu_seqlens.shape[0] - 1
     total_nt_val = chunk_indices.shape[0]
-    ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+    ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(HV), Int32(K), Int32(V))
 
     # Allocate output tensors
-    dq = torch.empty(1, T_total, H, K, dtype=torch.float32, device=device)
-    dk = torch.empty(1, T_total, H, K, dtype=torch.float32, device=device)
-    dv2 = torch.empty(1, T_total, H, V, dtype=torch.bfloat16, device=device)
-    dg = torch.empty(1, T_total, H, K, dtype=torch.float32, device=device)
-    db = torch.empty(1, T_total, H, dtype=torch.float32, device=device)
-    dA = torch.empty(1, T_total, H, BT, dtype=torch.float32, device=device)
+    dq = torch.empty(1, T_total, HV, K, dtype=torch.float32, device=device)
+    dk = torch.empty(1, T_total, HV, K, dtype=torch.float32, device=device)
+    dv2 = torch.empty(1, T_total, HV, V, dtype=torch.bfloat16, device=device)
+    dg = torch.empty(1, T_total, HV, K, dtype=torch.float32, device=device)
+    db = torch.empty(1, T_total, HV, dtype=torch.float32, device=device)
+    dA = torch.empty(1, T_total, HV, BT, dtype=torch.float32, device=device)
 
     compiled_fn = _get_compiled_bwd_wy(
         H,
+        HV,
         K,
         V,
         scale,
@@ -3212,15 +3223,15 @@ def chunk_kda_bwd_wy_dqkg_fused(
     if B != 1:
         q = q.reshape(1, T_total, H, K)
         k = k.reshape(1, T_total, H, K)
-        v = v.reshape(1, T_total, H, V)
-        v_new = v_new.reshape(1, T_total, H, V)
-        g = g.reshape(1, T_total, H, K)
-        beta = beta.reshape(1, T_total, H)
-        A = A.reshape(1, T_total, H, BT)
-        h = h.reshape(1, total_nt_val, H, K, V)
-        do = do.reshape(1, T_total, H, V)
-        dh = dh.reshape(1, total_nt_val, H, K, V)
-        dv = dv.reshape(1, T_total, H, V)
+        v = v.reshape(1, T_total, HV, V)
+        v_new = v_new.reshape(1, T_total, HV, V)
+        g = g.reshape(1, T_total, HV, K)
+        beta = beta.reshape(1, T_total, HV)
+        A = A.reshape(1, T_total, HV, BT)
+        h = h.reshape(1, total_nt_val, HV, K, V)
+        do = do.reshape(1, T_total, HV, V)
+        dh = dh.reshape(1, total_nt_val, HV, K, V)
+        dv = dv.reshape(1, T_total, HV, V)
 
     # TVM-FFI call
     compiled_fn(
@@ -3252,12 +3263,12 @@ def chunk_kda_bwd_wy_dqkg_fused(
 
     # rearrange back
     if B != 1:
-        dq = dq.reshape(B, T, H, K)
-        dk = dk.reshape(B, T, H, K)
-        dv2 = dv2.reshape(B, T, H, V)
-        dg = dg.reshape(B, T, H, K)
-        db = db.reshape(B, T, H)
-        dA = dA.reshape(B, T, H, BT)
+        dq = dq.reshape(B, T, HV, K)
+        dk = dk.reshape(B, T, HV, K)
+        dv2 = dv2.reshape(B, T, HV, V)
+        dg = dg.reshape(B, T, HV, K)
+        db = db.reshape(B, T, HV)
+        dA = dA.reshape(B, T, HV, BT)
 
     return dq, dk, dv2, db, dg, dA
 
@@ -3272,6 +3283,7 @@ def main():
     parser.add_argument("--B", type=int, default=1)
     parser.add_argument("--T", type=int, default=64)
     parser.add_argument("--H", type=int, default=1)
+    parser.add_argument("--HV", type=int, default=None, help="Number of value heads (default: H, i.e. no GVA)")
     parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--V", type=int, default=128)
     parser.add_argument("--scale", type=float, default=None)
@@ -3281,6 +3293,7 @@ def main():
     if args.scale is None:
         args.scale = args.K**-0.5
     B, T, H, K, V = args.B, args.T, args.H, args.K, args.V
+    HV = args.HV if args.HV is not None else H
     BT = args.chunk_size
     seq_lens = [63, 63, 63]
     seq_lens = [64]
@@ -3291,23 +3304,23 @@ def main():
     dtype, device = torch.bfloat16, "cuda"
     cu_seqlens = torch.tensor(_exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-    print(f"Config: B={B}, T={T}, H={H}, K={K}, V={V}, BT={BT}, scale={scale:.4f}")
+    print(f"Config: B={B}, T={T}, H={H}, HV={HV}, K={K}, V={V}, BT={BT}, scale={scale:.4f}")
     print(f"  Chunks per seq: {NT}, Total chunks: {B * NT}")
     print(f"  BK={64}, BV={64}, NK={K // 64}, NV={V // 64}")
 
-    # Generate test data
+    # Generate test data (q/k use H heads; all others use HV heads)
     torch.manual_seed(42)
     q = torch.randn(B, T, H, K, dtype=dtype, device=device)
     k = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    v_new = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-    beta = torch.randn(B, T, H, dtype=torch.bfloat16, device=device)
-    A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
-    h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-    do_t = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    dh = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-    dv = torch.randn(B, T, H, V, dtype=dtype, device=device)
+    v = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    v_new = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    g = torch.randn(B, T, HV, K, dtype=torch.float32, device=device) * 0.1
+    beta = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
+    h = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+    do_t = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    dh = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+    dv = torch.randn(B, T, HV, V, dtype=dtype, device=device)
 
     print("\n=== Compilation Test ===")
     try:
