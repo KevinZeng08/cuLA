@@ -2047,12 +2047,23 @@ class ChunkKdaBwdWyDqkgFused:
                     for i in cutlass.range_constexpr(bk_num_cols_per_wg):
                         db_val += rKgb_kg[i]
                 # atomic add for each row of db
+                # NOTE: must pass `.llvm_ptr` (LLVM ptr addrspace(3)) and set
+                # explicit sem/scope. Passing the raw cute._Pointer makes
+                # _normalize_ptr fall through (no `to_llvm_ptr` method on
+                # _Pointer), losing the SMEM address-space tag, which causes
+                # rare large mismatches in `db` (one partition's db_val gets
+                # silently dropped/corrupted).
                 if row < sub_seq_len:
                     sDb_row_ptr = cute.make_ptr(Float32, (sDb.iterator + row).toint(), cute.AddressSpace.smem, assumed_align=4)
-                    cute.arch.atomic_add(sDb_row_ptr, db_val)
+                    cute.arch.atomic_add(
+                        ptr=sDb_row_ptr.llvm_ptr,
+                        val=db_val,
+                        sem="relaxed",
+                        scope="cta",
+                    )
                 self.cuda_wg_sync_barrier.arrive_and_wait()
                 # store db to GMEM
-                if local_tidx < sub_seq_len:
+                if wg_idx == 0 and local_tidx < sub_seq_len:
                     db_gmem[(tok_offset + tile_idx * self.BT + local_tidx, (i_hv, Int32(0)))] = sDb[(local_tidx,)]
 
                 # dk = dk * exp2(gn[None, :] - g)
