@@ -132,17 +132,6 @@ def _ir(val, loc=None, ip=None):
     return val.ir_value(loc=loc, ip=ip) if hasattr(val, "ir_value") else val
 
 @dsl_user_op
-def atomicAdd(dst_ptr: cute.Pointer, val: Int32 | Float32, *, loc=None, ip=None) -> Int32 | Float32:
-    return cute.arch.atomic_add(
-        ptr=dst_ptr.llvm_ptr,
-        val=val,
-        sem="relaxed",
-        scope="sys",
-        loc=loc,
-        ip=ip,
-    )
-
-@dsl_user_op
 def bf16_to_f32(val, *, loc=None, ip=None):
     """Convert a BFloat16 value to Float32 using arith.extf (no inline asm)."""
     bf16_ir = BFloat16(val).ir_value(loc=loc, ip=ip)
@@ -2060,7 +2049,7 @@ class ChunkKdaBwdWyDqkgFused:
                 # atomic add for each row of db
                 if row < sub_seq_len:
                     sDb_row_ptr = cute.make_ptr(Float32, (sDb.iterator + row).toint(), cute.AddressSpace.smem, assumed_align=4)
-                    atomicAdd(sDb_row_ptr, db_val)
+                    cute.arch.atomic_add(sDb_row_ptr, db_val)
                 self.cuda_wg_sync_barrier.arrive_and_wait()
                 # store db to GMEM
                 if local_tidx < sub_seq_len:

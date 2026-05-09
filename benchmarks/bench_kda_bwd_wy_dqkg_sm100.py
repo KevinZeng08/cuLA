@@ -180,7 +180,7 @@ def check_determinism(H=4, HV=None, total_T=2001, num_seqs=4, iters=1000, beta_d
         assert torch.equal(dg_out, ref_dg), f"dg mismatch at iter {i}"
         assert torch.equal(dA_out, ref_dA), f"dA mismatch at iter {i}"
         # NOTE: for db, kernel uses atomic add which can cause non-determinism, so we use a looser check here
-        torch.testing.assert_close(db_out, ref_db, rtol=1e-5, atol=1e-5), f"db mismatch at iter {i}"
+        torch.testing.assert_close(db_out, ref_db, rtol=1e-5, atol=1e-5, msg=f"db mismatch at iter {i}")
         assert torch.isnan(dq_out).sum() == 0, f"dq contains NaNs at iter {i}"
         assert torch.isnan(dk_out).sum() == 0, f"dk contains NaNs at iter {i}"
         assert torch.isnan(dv_out).sum() == 0, f"dv contains NaNs at iter {i}"
