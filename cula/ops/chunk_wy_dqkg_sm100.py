@@ -16,6 +16,7 @@ from cutlass.cute.arch import (
     mbarrier_init,
     mbarrier_init_fence,
     mbarrier_wait,
+    mbarrier_arrive_and_expect_tx,
     mbarrier_arrive,
     sync_threads,
 )
@@ -947,11 +948,14 @@ class ChunkKdaBwdWyDqkgFused:
             bar_load_dv: cute.struct.MemRange[Int64, self.vloop_stage * 2]
             bar_mma_dvb: cute.struct.MemRange[Int64, self.mma_stage * 2]
             bar_load_beta: cute.struct.MemRange[Int64, 1 * 2]
-            bar_load_h: cute.struct.MemRange[Int64, self.vloop_stage * 2]
-            bar_load_dh: cute.struct.MemRange[Int64, self.vloop_stage * 2]
+            bar_tma_h: cute.struct.MemRange[Int64, self.vloop_stage]
+            bar_mma_cuda_h: cute.struct.MemRange[Int64, self.vloop_stage]
+            bar_tma_dh: cute.struct.MemRange[Int64, self.vloop_stage]
+            bar_mma_cuda_dh: cute.struct.MemRange[Int64, self.vloop_stage]
+            bar_tma_v: cute.struct.MemRange[Int64, self.vloop_stage]
+            bar_mma_cuda_v: cute.struct.MemRange[Int64, self.vloop_stage]
             bar_load_do: cute.struct.MemRange[Int64, self.vloop_stage * 2]
             bar_load_g: cute.struct.MemRange[Int64, self.kloop_stage * 2]
-            bar_load_v: cute.struct.MemRange[Int64, self.vloop_stage * 2]
             bar_load_vnew: cute.struct.MemRange[Int64, self.vloop_stage * 2]
             bar_load_q: cute.struct.MemRange[Int64, self.kloop_stage * 2]
             bar_load_k: cute.struct.MemRange[Int64, self.kloop_stage * 2]
@@ -1215,10 +1219,24 @@ class ChunkKdaBwdWyDqkgFused:
 
         # Barrier Initialization
         bar_mma_done_vloop_ptr = storage.bar_mma_done_vloop.data_ptr()
+        # NOTE: for h, dh and v, consumer contains both MMA and CUDA Core, so we use original mbarrier declaration instead of pipeline utils
+        bar_tma_h_ptr = storage.bar_tma_h.data_ptr()
+        bar_mma_cuda_h_ptr = storage.bar_mma_cuda_h.data_ptr()
+        bar_tma_dh_ptr = storage.bar_tma_dh.data_ptr()
+        bar_mma_cuda_dh_ptr = storage.bar_mma_cuda_dh.data_ptr()
+        bar_tma_v_ptr = storage.bar_tma_v.data_ptr()
+        bar_mma_cuda_v_ptr = storage.bar_mma_cuda_v.data_ptr()
         if warp_idx == 0:
             with elect_one():
-                for i in cutlass.range(self.mma_stage):
+                for i in cutlass.range(self.mma_stage, unroll_full=True):
                     mbarrier_init(bar_mma_done_vloop_ptr + i, 1)
+                for i in cutlass.range(self.vloop_stage, unroll_full=True):
+                    mbarrier_init(bar_tma_h_ptr + i, 1)
+                    mbarrier_init(bar_mma_cuda_h_ptr + i, num_cuda_warps_total * 32 + 1)
+                    mbarrier_init(bar_tma_dh_ptr + i, 1)
+                    mbarrier_init(bar_mma_cuda_dh_ptr + i, num_cuda_warps_total * 32 + 1)
+                    mbarrier_init(bar_tma_v_ptr + i, 1)
+                    mbarrier_init(bar_mma_cuda_v_ptr + i, num_cuda_warps_total * 32 + 1)
                 mbarrier_init_fence()
 
         # ====== Pipeline Definition ======
@@ -1235,20 +1253,6 @@ class ChunkKdaBwdWyDqkgFused:
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             tx_count=self.tma_bytes_dv,
-        )
-        pipeline_load_h = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.bar_load_h.data_ptr(),
-            num_stages=self.vloop_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) + num_cuda_warps_total),
-            tx_count=self.tma_bytes_h,
-        )
-        pipeline_load_dh = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.bar_load_dh.data_ptr(),
-            num_stages=self.vloop_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) + num_cuda_warps_total),
-            tx_count=self.tma_bytes_dh,
         )
         pipeline_load_do = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.bar_load_do.data_ptr(),
@@ -1270,13 +1274,6 @@ class ChunkKdaBwdWyDqkgFused:
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
             consumer_group=make_thread_cooperative_group(num_cuda_warps_total + len(self.aux_warp_ids)),
             tx_count=self.tma_bytes_g,
-        )
-        pipeline_load_v = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.bar_load_v.data_ptr(),
-            num_stages=self.vloop_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) + num_cuda_warps_total),
-            tx_count=self.tma_bytes_v,
         )
         pipeline_load_k = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.bar_load_k.data_ptr(),
@@ -1666,17 +1663,8 @@ class ChunkKdaBwdWyDqkgFused:
             load_beta_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, 1
             )
-            load_h_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.vloop_stage
-            )
-            load_dh_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.vloop_stage
-            )
             load_g_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.kloop_stage
-            )
-            load_v_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.vloop_stage
             )
             mma_dvb_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.mma_stage
@@ -1744,6 +1732,7 @@ class ChunkKdaBwdWyDqkgFused:
             num_stores_f32 = bk_num_cols_per_wg // 8
 
             vloop_stage_idx = 0
+            vloop_phase = 0
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 G = HV // H
@@ -1778,8 +1767,8 @@ class ChunkKdaBwdWyDqkgFused:
                 db_val = Float32(0.0)
                 for v_iter in cutlass.range(self.num_v_tiles):
                     # dgk += sum(h * dh, axis=0)
-                    pipeline_load_h.consumer_wait(load_h_consumer_state)
-                    pipeline_load_dh.consumer_wait(load_dh_consumer_state)
+                    mbarrier_wait(bar_tma_h_ptr + vloop_stage_idx, vloop_phase)
+                    mbarrier_wait(bar_tma_dh_ptr + vloop_stage_idx, vloop_phase)
 
                     sH_raw_ptr = cute.make_ptr(
                         self.io_dtype, sH_ptr_base + vloop_stage_idx * vloop_opB_bytes_per_stage, cute.AddressSpace.smem
@@ -1799,10 +1788,8 @@ class ChunkKdaBwdWyDqkgFused:
                             for j in cutlass.range_constexpr(8):
                                 sDgk[(local_tidx,)] += h_dh_vals[j]
 
-                    pipeline_load_dh.consumer_release(load_dh_consumer_state)
-                    load_dh_consumer_state.advance()
-                    pipeline_load_h.consumer_release(load_h_consumer_state)
-                    load_h_consumer_state.advance()
+                    mbarrier_arrive(bar_mma_cuda_h_ptr + vloop_stage_idx)
+                    mbarrier_arrive(bar_mma_cuda_dh_ptr + vloop_stage_idx)
 
                     pipeline_mma_dvb.consumer_wait(mma_dvb_consumer_state)
                     tcgen05_fence_after()
@@ -1817,7 +1804,7 @@ class ChunkKdaBwdWyDqkgFused:
                     dvb_f32_val = TensorSSA(dvb_f32, (bv_num_cols_per_wg,), Float32)
 
                     # db += sum(dvb * v, axis=1)
-                    pipeline_load_v.consumer_wait(load_v_consumer_state)
+                    mbarrier_wait(bar_tma_v_ptr + vloop_stage_idx, vloop_phase)
                     rV_bf16 = cute.make_rmem_tensor((bv_num_cols_per_wg,), self.io_dtype)
                     sV_raw_ptr_cur = cute.make_ptr(
                         self.io_dtype, sV_ptr_base + vloop_stage_idx * v_opB_bytes_per_stage, cute.AddressSpace.smem
@@ -1843,8 +1830,7 @@ class ChunkKdaBwdWyDqkgFused:
                         for i in cutlass.range_constexpr(bv_num_cols_per_wg):
                             db_val += rV_fp32[i]
 
-                    pipeline_load_v.consumer_release(load_v_consumer_state)
-                    load_v_consumer_state.advance()
+                    mbarrier_arrive(bar_mma_cuda_v_ptr + vloop_stage_idx)
 
                     # ── dv2 epilogue: dv2 = dvb * beta, cast to bf16, store to gmem ──
                     dvb_f32_rmem = cute.make_rmem_tensor((bv_num_cols_per_wg,), Float32)
@@ -1874,6 +1860,7 @@ class ChunkKdaBwdWyDqkgFused:
                             store_256b(base_addr + s * 32, chunk)
 
                     vloop_stage_idx = (vloop_stage_idx + 1) % self.vloop_stage
+                vloop_phase ^= 1
 
                 # gk_exp = exp2(g)
                 pipeline_load_g.consumer_wait(load_g_consumer_state)
@@ -2278,12 +2265,6 @@ class ChunkKdaBwdWyDqkgFused:
             load_dv_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.vloop_stage
             )
-            load_h_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.vloop_stage
-            )
-            load_dh_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.vloop_stage
-            )
             load_do_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.vloop_stage
             )
@@ -2293,9 +2274,6 @@ class ChunkKdaBwdWyDqkgFused:
             load_g_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.kloop_stage
             )
-            load_v_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.vloop_stage
-            )
             load_k_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.kloop_stage
             )
@@ -2304,6 +2282,7 @@ class ChunkKdaBwdWyDqkgFused:
             )
 
             vloop_stage_idx = 0
+            vloop_phase = 1 # init as 1 for producer
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 G = HV // H
@@ -2349,14 +2328,15 @@ class ChunkKdaBwdWyDqkgFused:
                         vloop_tiled_mma,
                         i_hv, i_t
                     )
-                    pipeline_load_h.producer_acquire(load_h_producer_state)
+                    mbarrier_wait(bar_mma_cuda_h_ptr + vloop_stage_idx, vloop_phase)
+                    with elect_one():
+                        mbarrier_arrive_and_expect_tx(bar_tma_h_ptr + vloop_stage_idx, self.tma_bytes_h)
                     cute.copy(
                         tma_atom_h,
                         tHgH[(None, 0, 0)],
                         tHsH[(None, vloop_stage_idx)],
-                        tma_bar_ptr=pipeline_load_h.producer_get_barrier(load_h_producer_state),
+                        tma_bar_ptr=bar_tma_h_ptr + vloop_stage_idx,
                     )
-                    load_h_producer_state.advance()
 
                     tma_dh_v = cute.domain_offset((0, v_iter * self.BV, (0, 0)), tma_tensor_dh)
                     tDHsDH, tDHgDH = self._tma_partition_B(
@@ -2367,14 +2347,15 @@ class ChunkKdaBwdWyDqkgFused:
                         vloop_tiled_mma,
                         i_hv, i_t
                     )
-                    pipeline_load_dh.producer_acquire(load_dh_producer_state)
+                    mbarrier_wait(bar_mma_cuda_dh_ptr + vloop_stage_idx, vloop_phase)
+                    with elect_one():
+                        mbarrier_arrive_and_expect_tx(bar_tma_dh_ptr + vloop_stage_idx, self.tma_bytes_dh)
                     cute.copy(
                         tma_atom_dh,
                         tDHgDH[(None, 0, 0)],
                         tDHsDH[(None, vloop_stage_idx)],
-                        tma_bar_ptr=pipeline_load_dh.producer_get_barrier(load_dh_producer_state),
+                        tma_bar_ptr=bar_tma_dh_ptr + vloop_stage_idx,
                     )
-                    load_dh_producer_state.advance()
 
                     tma_do_v = cute.domain_offset((tok_offset, v_iter * self.BV, (0, 0)), tma_tensor_do)
                     tDOsDo, tDOgDo = self._tma_partition_A(
@@ -2421,14 +2402,15 @@ class ChunkKdaBwdWyDqkgFused:
                         dA_vloop_tiled_mma,
                         Int32(0), i_hv,
                     )
-                    pipeline_load_v.producer_acquire(load_v_producer_state)
+                    mbarrier_wait(bar_mma_cuda_v_ptr + vloop_stage_idx, vloop_phase)
+                    with elect_one():
+                        mbarrier_arrive_and_expect_tx(bar_tma_v_ptr + vloop_stage_idx, self.tma_bytes_v)
                     cute.copy(
                         tma_atom_v,
                         tVgV[(None, tile_idx, 0)],
                         tVsV[(None, vloop_stage_idx)],
-                        tma_bar_ptr=pipeline_load_v.producer_get_barrier(load_v_producer_state),
+                        tma_bar_ptr=bar_tma_v_ptr + vloop_stage_idx,
                     )
-                    load_v_producer_state.advance()
 
                     # load v_new
                     tma_vnew_v = cute.domain_offset((tok_offset, v_iter * self.BV, (0, 0)), tma_tensor_vnew)
@@ -2450,6 +2432,7 @@ class ChunkKdaBwdWyDqkgFused:
                     load_vnew_producer_state.advance()
 
                     vloop_stage_idx = (vloop_stage_idx + 1) % self.vloop_stage
+                vloop_phase ^= 1
                 
                 # Load g
                 tma_g_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_g)
@@ -2515,12 +2498,6 @@ class ChunkKdaBwdWyDqkgFused:
             mma_dvb_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_stage
             )
-            load_h_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.vloop_stage
-            )
-            load_dh_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.vloop_stage
-            )
             load_do_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.vloop_stage
             )
@@ -2532,9 +2509,6 @@ class ChunkKdaBwdWyDqkgFused:
             )
             mma_dk_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_stage
-            )
-            load_v_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.vloop_stage
             )
             mma_dw_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_stage
@@ -2567,6 +2541,7 @@ class ChunkKdaBwdWyDqkgFused:
             vloop_stage_idx = 0
             a_stage_idx = 0
             mma_vloop_phase = 0
+            vloop_phase = 0
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 G = HV // H
@@ -2603,7 +2578,7 @@ class ChunkKdaBwdWyDqkgFused:
 
                 for v_iter in cutlass.range(self.num_v_tiles):
                     is_accum = False if v_iter == 0 else True
-                    pipeline_load_h.consumer_wait(load_h_consumer_state)
+                    mbarrier_wait(bar_tma_h_ptr + vloop_stage_idx, vloop_phase)
                     pipeline_load_do.consumer_wait(load_do_consumer_state)
                     sDo_raw_ptr = cute.make_ptr(
                         self.io_dtype,
@@ -2680,7 +2655,7 @@ class ChunkKdaBwdWyDqkgFused:
                     mma_ws_ss_m64n128_k_k_call(vloop_opA_smem, desc_a_base, vloop_opB_smem, desc_b_base, TMEM_DW_ACC_OFF, self.BV, is_accum)
 
                     # dA += dv @ v^T
-                    pipeline_load_v.consumer_wait(load_v_consumer_state)
+                    mbarrier_wait(bar_tma_v_ptr + vloop_stage_idx, vloop_phase)
                     sV_raw = cute.make_ptr(
                         self.io_dtype, sV_ptr_base + vloop_stage_idx * v_opB_bytes_per_stage, cute.AddressSpace.smem
                     )
@@ -2711,11 +2686,8 @@ class ChunkKdaBwdWyDqkgFused:
                         pipeline_mma_dw.producer_commit(mma_dw_producer_state)
                         mma_dw_producer_state.advance()
 
-                    pipeline_load_h.consumer_release(load_h_consumer_state)
-                    load_h_consumer_state.advance()
-
-                    pipeline_load_v.consumer_release(load_v_consumer_state)
-                    load_v_consumer_state.advance()
+                    umma_arrive(bar_mma_cuda_h_ptr + vloop_stage_idx)
+                    umma_arrive(bar_mma_cuda_v_ptr + vloop_stage_idx)
 
                     # dk += v_new @ dh
                     pipeline_load_vnew.consumer_wait(load_vnew_consumer_state)
@@ -2733,7 +2705,7 @@ class ChunkKdaBwdWyDqkgFused:
                                     smem_store_bf16x8_sw128(sDvnew_raw_ptr, row, col * 8, zeros8)
                         cute.arch.fence_proxy("async.shared", space="cta")
 
-                    pipeline_load_dh.consumer_wait(load_dh_consumer_state)
+                    mbarrier_wait(bar_tma_dh_ptr + vloop_stage_idx, vloop_phase)
                     if v_iter == 0:
                         pipeline_mma_dk.producer_acquire(mma_dk_producer_state)
                     
@@ -2753,8 +2725,7 @@ class ChunkKdaBwdWyDqkgFused:
                         pipeline_mma_dk.producer_commit(mma_dk_producer_state)
                         mma_dk_producer_state.advance()
 
-                    pipeline_load_dh.consumer_release(load_dh_consumer_state)
-                    load_dh_consumer_state.advance()
+                    umma_arrive(bar_mma_cuda_dh_ptr + vloop_stage_idx)
 
                     # add tcgen05.commit and mbar.wait to make sure dq/dk/dw MMA finished
                     umma_arrive(bar_mma_done_vloop_ptr + 0)
@@ -2762,6 +2733,7 @@ class ChunkKdaBwdWyDqkgFused:
                     mma_vloop_phase ^= 1
 
                     vloop_stage_idx = (vloop_stage_idx + 1) % self.vloop_stage
+                vloop_phase ^= 1
                 
                 pipeline_prologue_dw.consumer_wait(prologue_dw_consumer_state)
                 cute.arch.fence_proxy("async.shared", space="cta")
