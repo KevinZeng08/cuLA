@@ -74,7 +74,7 @@ TMEM_DQ_ACC_OFF = 32  # [32,96)  64 cols  dq fp32 acc; Phase 3: step2/step3 resu
 TMEM_DK_ACC_OFF = 96  # [96,160) 64 cols  dk fp32 acc
 TMEM_DW_ACC_OFF = 160 # [160,224] 64 cols dw fp32 acc
 TMEM_FLEX_OFF = 224  # [224,256) 32 cols  dvb time-shared
-TMEM_A_BF16_OFF = 256  # [256,272) 16 cols  A_bf16 TS opA (persistent)
+TMEM_A_BF16_OFF = 256  # [256,272) 16 cols  A_bf16 TS opA (persistent) (not used currently)
 TMEM_DKGB_ACC_OFF = 272 # [272,336) 64 cols, dkgb fp32 acc
 TMEM_DA2_ACC_OFF = 336  # [336,368) 32 cols  dA fp32 acc, used for dA=dA@A and dA=A@dA
 TMEM_DQ_SCALED_OFF = 368 # [368,432) 64 cols  dq_scaled (stored for dg)
@@ -252,22 +252,6 @@ def smem_store_f32x4_sw128(raw_ptr: cute.Pointer, row: Int32, col_base: Int32, d
     smem_t = cute.make_tensor(smem_ptr, cute.make_layout((4,), stride=(1,)))
     cute.autovec_copy(data, smem_t)
 
-# SMEM B: MN-major
-@cute.jit
-def mma_ws_ts_m64n128_call(
-    tmem_a_base: Int32, 
-    b_smem_layout: cute.Layout, desc_b_base: Tcgen05SmemDescriptor,
-    tmem_c: Int32, K: Int32
-):
-    with elect_one():
-        b_outer = b_smem_layout.outer
-        for ks in cutlass.range_constexpr(K // 16):
-            scale = 0 if ks == 0 else 1
-            b_off = cute.crd2idx(((0, 0), 0, ks, 0), b_outer) * ELEM_BYTES_BF16
-            desc_b = desc_b_base + b_off
-            tmem_a = tmem_a_base + Int32(ks * 4)
-            tcgen05mma_ws_ts_f16(tmem_a, desc_b, tmem_c, IDESC_F16_M64_N128_K_MN, scale)
-
 @cute.jit
 def mma_ws_ss_m64n128_call(
     a_smem_layout: cute.Layout, desc_a_base: Tcgen05SmemDescriptor, 
@@ -321,22 +305,6 @@ def mma_ws_ss_m64n128_mn_mn_call(
             desc_b = desc_b_base + b_off
             tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_c, IDESC_F16_M64_N128_MN_MN, scale)
             scale = 1
-
-@cute.jit
-def mma_ws_ts_m64n64_call(
-    tmem_a_base: Int32, 
-    b_smem_layout: cute.Layout, desc_b_base: Tcgen05SmemDescriptor,
-    tmem_c: Int32, K: Int32
-):
-    pass
-
-@cute.jit
-def mma_ws_ss_m64n64_call(
-    a_smem_layout: cute.Layout, desc_a_base: Tcgen05SmemDescriptor, 
-    b_smem_layout: cute.Layout, desc_b_base: Tcgen05SmemDescriptor,
-    tmem_c: Int32, K: Int32
-):
-    pass
 
 @cute.jit
 def mma_ws_ss_m64n64_k_k_call(
@@ -994,7 +962,6 @@ class ChunkKdaBwdWyDqkgFused:
             bar_mma_dA: cute.struct.MemRange[Int64, self.mma_stage * 2]
             bar_mma_dA2: cute.struct.MemRange[Int64, self.mma_stage * 2]
             bar_mma_dA3: cute.struct.MemRange[Int64, self.mma_stage * 2]
-            bar_mma_done_dA: cute.struct.MemRange[Int64, self.mma_stage]
             bar_mma_done_vloop: cute.struct.MemRange[Int64, self.mma_stage]
             bar_prologue_dw: cute.struct.MemRange[Int64, self.kloop_stage * 2]
             bar_prologue_kg: cute.struct.MemRange[Int64, self.kloop_stage * 2]
@@ -1003,7 +970,7 @@ class ChunkKdaBwdWyDqkgFused:
             bar_store_dg: cute.struct.MemRange[Int64, self.kloop_stage * 2]
             # TMEM holding buffer
             tmem_holding_buf: Int32
-            # A, stage=1, [BT,BT], 8KB
+            # A, stage=2, [BT,BT], 16KB
             buf_A: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(A_mn_opA_smem)],
                 self.buffer_align_bytes,
@@ -1061,8 +1028,10 @@ class ChunkKdaBwdWyDqkgFused:
                 cute.struct.MemRange[cutlass.Float32, self.BT],
                 128,
             ]
+            # 2 slots per row, one per warpgroup, for deterministic db reduction
+            # (avoids cross-wg fp32 atomicAdd on shared memory).
             s_db: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.BT],
+                cute.struct.MemRange[cutlass.Float32, self.BT * 2],
                 128,
             ]
             s_gn: cute.struct.Align[
@@ -1666,9 +1635,11 @@ class ChunkKdaBwdWyDqkgFused:
             cute.make_ptr(Float32, storage.s_beta.data_ptr().toint(), cute.AddressSpace.smem),
             cute.make_layout((self.BT, ), stride=(1, )),
         )
+        # sDb layout: (BT, 2). Inner dim = wg_idx slot. Stride (1, BT) so each
+        # wg's column is contiguous (better for the reduce in Phase 3).
         sDb = cute.make_tensor(
             cute.make_ptr(Float32, storage.s_db.data_ptr().toint(), cute.AddressSpace.smem),
-            cute.make_layout((self.BT, ), stride=(1, )),
+            cute.make_layout((self.BT, 2), stride=(1, self.BT)),
         )
         sDgk = cute.make_tensor(
             cute.make_ptr(Float32, storage.s_dgk.data_ptr().toint(), cute.AddressSpace.smem),
@@ -1793,9 +1764,10 @@ class ChunkKdaBwdWyDqkgFused:
                 # reading sDgk[col] above. This was the source of the
                 # non-deterministic dg accuracy bug.
                 self.cuda_wg_sync_barrier.arrive_and_wait()
-                # fill db, dgk to 0
+                # fill db, dgk to 0. Each wg zeroes its own sDb column.
                 if local_tidx < self.BT:
-                    sDb[local_tidx] = Float32(0.0)
+                    sDb[local_tidx, 0] = Float32(0.0)
+                    sDb[local_tidx, 1] = Float32(0.0)
                 if local_tidx < self.BK:
                     sDgk[local_tidx] = Float32(0.0)
                 self.cuda_wg_sync_barrier.arrive_and_wait()
@@ -2046,25 +2018,28 @@ class ChunkKdaBwdWyDqkgFused:
                 if row < sub_seq_len:
                     for i in cutlass.range_constexpr(bk_num_cols_per_wg):
                         db_val += rKgb_kg[i]
-                # atomic add for each row of db
-                # NOTE: must pass `.llvm_ptr` (LLVM ptr addrspace(3)) and set
-                # explicit sem/scope. Passing the raw cute._Pointer makes
-                # _normalize_ptr fall through (no `to_llvm_ptr` method on
-                # _Pointer), losing the SMEM address-space tag, which causes
-                # rare large mismatches in `db` (one partition's db_val gets
-                # silently dropped/corrupted).
-                if row < sub_seq_len:
-                    sDb_row_ptr = cute.make_ptr(Float32, (sDb.iterator + row).toint(), cute.AddressSpace.smem, assumed_align=4)
-                    cute.arch.atomic_add(
-                        ptr=sDb_row_ptr.llvm_ptr,
-                        val=db_val,
-                        sem="relaxed",
-                        scope="cta",
-                    )
+                
+                # Deterministic db reduction without atomicAdd.
+                # 4 partitions per row come from 4 warps (warp_row_tile in {0,1},
+                # warp_col_tile in {0,1}) x 2 wgs. Reduce in a fixed order so
+                # the result is bitwise reproducible across launches:
+                #   Phase 1: warp_col_tile==0 writes its db_val into
+                #            sDb[row, wg_idx]   (single writer per slot)
+                #   Phase 2: warp_col_tile==1 RMW-adds its db_val into the
+                #            same slot          (still single writer per slot)
+                #   Phase 3: WG0 sums the 2 wg-slots in fixed order and stores
+                #            to GMEM.
+                # No race, no atomic, no fp ordering nondeterminism.
+                if warp_col_tile == 0 and row < sub_seq_len:
+                    sDb[row, wg_idx] = db_val
                 self.cuda_wg_sync_barrier.arrive_and_wait()
-                # store db to GMEM
+                if warp_col_tile == 1 and row < sub_seq_len:
+                    sDb[row, wg_idx] = sDb[row, wg_idx] + db_val
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+                # store db to GMEM (WG0 only). Sum order is fixed (slot 0 + slot 1).
                 if wg_idx == 0 and local_tidx < sub_seq_len:
-                    db_gmem[(tok_offset + tile_idx * self.BT + local_tidx, (i_hv, Int32(0)))] = sDb[(local_tidx,)]
+                    db_sum = sDb[(local_tidx, 0)] + sDb[(local_tidx, 1)]
+                    db_gmem[(tok_offset + tile_idx * self.BT + local_tidx, (i_hv, Int32(0)))] = db_sum
 
                 # dk = dk * exp2(gn[None, :] - g)
                 pipeline_mma_dk.consumer_wait(mma_dk_consumer_state)
@@ -3341,11 +3316,6 @@ def main():
             chunk_size=BT,
         )
         torch.cuda.synchronize()
-        # do_slice = do_t[0, :, 1, :].to(torch.float32)
-        # h_slice = h[0, 0, 1, :, :].to(torch.float32)
-        # dq_ref = do_slice @ h_slice.T
-        import pdb;pdb.set_trace()
-        # torch.testing.assert_close(dq_ref, dq[0,:,1,:], rtol=1e-2, atol=1e-2)
         print(f"  dq shape: {dq.shape}, dtype: {dq.dtype}")
         print(f"  dk shape: {dk.shape}, dtype: {dk.dtype}")
         print(f"  dv2 shape: {dv2.shape}, dtype: {dv2.dtype}")
