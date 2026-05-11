@@ -1222,7 +1222,7 @@ class ChunkKdaBwdWyDqkgFused:
                 mbarrier_init_fence()
 
         # ====== Pipeline Definition ======
-        pipeline_load_A = pipeline.PipelineTmaAsync.create(
+        pipeline_load_A = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.bar_load_A.data_ptr(),
             num_stages=self.a_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
@@ -1250,7 +1250,6 @@ class ChunkKdaBwdWyDqkgFused:
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) + num_cuda_warps_total),
             tx_count=self.tma_bytes_dh,
         )
-        # NOTE: UMMA as consumer to call tcgen05.commit
         pipeline_load_do = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.bar_load_do.data_ptr(),
             num_stages=self.vloop_stage,
@@ -1299,22 +1298,22 @@ class ChunkKdaBwdWyDqkgFused:
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
         )
-        pipeline_mma_dq = pipeline.PipelineAsync.create(
+        pipeline_mma_dq = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.bar_mma_dq.data_ptr(),
             num_stages=self.mma_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
         )
-        pipeline_mma_dk = pipeline.PipelineAsync.create(
+        pipeline_mma_dk = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.bar_mma_dk.data_ptr(),
             num_stages=self.mma_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
         )
-        pipeline_mma_dw = pipeline.PipelineAsync.create(
+        pipeline_mma_dw = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.bar_mma_dw.data_ptr(),
             num_stages=self.mma_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
         )
         pipeline_mma_dA = pipeline.PipelineUmmaAsync.create(
@@ -1335,29 +1334,29 @@ class ChunkKdaBwdWyDqkgFused:
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
         )
-        pipeline_prologue_dw = pipeline.PipelineAsync.create(
+        pipeline_prologue_dw = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.bar_prologue_dw.data_ptr(),
             num_stages=self.kloop_stage,
             producer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
         )
-        pipeline_prologue_kg = pipeline.PipelineAsync.create(
+        pipeline_prologue_kg = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.bar_prologue_kg.data_ptr(),
             num_stages=self.kloop_stage,
             producer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
         )
-        pipeline_prologue_dA2 = pipeline.PipelineAsync.create(
+        pipeline_prologue_dA2 = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.bar_prologue_dA2.data_ptr(),
             num_stages=self.mma_stage,
             producer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
         )
-        pipeline_prologue_dA3 = pipeline.PipelineAsync.create(
+        pipeline_prologue_dA3 = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.bar_prologue_dA3.data_ptr(),
             num_stages=self.mma_stage,
             producer_group=make_thread_cooperative_group(num_cuda_warps_total * 32),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id]) * 32),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
         )
         pipeline_mma_dkgb = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.bar_mma_dkgb.data_ptr(),
