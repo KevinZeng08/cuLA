@@ -445,7 +445,8 @@ def main():
 
     for H in args.heads:
         HV = args.hv if args.hv is not None else H
-        check_determinism(H=H, HV=HV, iters=10000)
+        if not args.ncu:
+            check_determinism(H=H, HV=HV, iters=10000)
 
         fixed_res, varlen_res = [], []
 
