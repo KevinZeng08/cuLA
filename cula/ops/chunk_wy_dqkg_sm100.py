@@ -1212,6 +1212,7 @@ class ChunkKdaBwdWyDqkgFused:
             cpasync.prefetch_descriptor(tma_atom_vnew)
             cpasync.prefetch_descriptor(tma_atom_k)
             cpasync.prefetch_descriptor(tma_atom_q)
+            cpasync.prefetch_descriptor(tma_atom_dg)
 
         # ===================== SMEM allocation =====================
         smem = utils.SmemAllocator()
