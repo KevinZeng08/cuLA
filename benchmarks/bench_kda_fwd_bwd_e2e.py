@@ -580,7 +580,6 @@ def main():
             result = check_determinism(num_seqs=num_seqs, T=T, iters=1000)
             print(f"  num_seqs={num_seqs}  T={T:5d}  {'PASS' if result else 'FAIL'}")
         print("[Determinism Check] All passed.\n")
-        return
 
     fixed_configs = [
         # (B, T)
