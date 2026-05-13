@@ -222,6 +222,8 @@ def check_determinism(num_seqs=5, T=512, iters=20):
     for i in range(iters):
         out = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
         for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
+            assert torch.isnan(out[name]).sum() == 0, f"[determinism] cuLA {name} has NaNs at iter {i}"
+            assert torch.isfinite(out[name]).all(), f"[determinism] cuLA {name} has infs at iter {i}"
             assert torch.equal(out[name], ref[name]), f"[determinism] cuLA {name} mismatch at iter {i}"
     return True
 
@@ -577,7 +579,7 @@ def main():
         det_configs = [(5, 1024), (10, 4096), (10, 8192), (10, 16384)]
         print("\n[Determinism Check] cuLA chunk_kda E2E ...")
         for num_seqs, T in det_configs:
-            result = check_determinism(num_seqs=num_seqs, T=T, iters=1000)
+            result = check_determinism(num_seqs=num_seqs, T=T, iters=2000)
             print(f"  num_seqs={num_seqs}  T={T:5d}  {'PASS' if result else 'FAIL'}")
         print("[Determinism Check] All passed.\n")
 
