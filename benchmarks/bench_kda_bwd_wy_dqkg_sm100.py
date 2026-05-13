@@ -65,10 +65,12 @@ WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
 
+
 def generate_balanced_seqlens(total_tokens, num_seqs):
     base = total_tokens // num_seqs
     remainder = total_tokens % num_seqs
     return [base] * (num_seqs - 1) + [base + remainder]
+
 
 # ============================================================
 # Helpers
@@ -150,6 +152,7 @@ def run_cutedsl(inputs: dict):
         chunk_size=BT,
         chunk_indices=inputs["chunk_indices"],
     )
+
 
 def check_determinism(H=4, HV=None, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYPE):
     """Verify deterministic outputs across repeated runs."""
@@ -252,7 +255,6 @@ def bench_fixed(configs, H: int, HV: int | None = None):
         }
         results.append(r)
 
-        del inputs
         torch.cuda.empty_cache()
 
     return results
@@ -322,7 +324,6 @@ def bench_varlen(configs, H: int, HV: int | None = None):
         }
         results.append(r)
 
-        del inputs
         torch.cuda.empty_cache()
 
     return results

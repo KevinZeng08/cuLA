@@ -346,6 +346,7 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
 
     return q, k, v, g, beta, scale, cu_seqlens, chunk_indices
 
+
 def prepare_bwd_wy_dqkg_fused_inputs(
     B: int,
     T: int,

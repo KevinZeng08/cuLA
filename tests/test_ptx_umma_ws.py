@@ -41,8 +41,7 @@ from cutlass.cute.nvgpu.tcgen05 import (
     smem_descriptor_to_int,
 )
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.tensor import TensorSSA
-from cutlass.cute.typing import Float16, Float32, Int32, Int64, TFloat32, BFloat16
+from cutlass.cute.typing import BFloat16, Float32, Int32, Int64, TFloat32
 
 from cula.ops.intrinsics_sm100 import (
     store_256b,
@@ -60,8 +59,8 @@ from cula.ops.ptx_umma_ext import (
 M_DIM, N_DIM = 64, 64
 # TODO: support arbitrary K
 K_DIM_TF32 = 8  # kind::tf32  → K>=8, tile size
-A_K_STEP_BYTES_TF32 = M_DIM * 8 * 4 # smem offset for each K-atom in operand A
-B_K_STEP_BYTES_TF32 = N_DIM * 8 * 4 # smem offset for each K-atom in operand B
+A_K_STEP_BYTES_TF32 = M_DIM * 8 * 4  # smem offset for each K-atom in operand A
+B_K_STEP_BYTES_TF32 = N_DIM * 8 * 4  # smem offset for each K-atom in operand B
 K_DIM_F16 = 128  # default after sweep
 # NOTE: per-K-atom byte offsets are derived from the SMEM layout at runtime
 # (see _WsSsF16Kernel) so K_DIM_F16 can be any multiple of 16. The layout's
@@ -188,7 +187,7 @@ class _WsSsTf32Kernel:
         # T2R → R2G: tcgen05_ld directly into store_256b (type-agnostic, like C++ reinterpret_cast)
         vec_i32 = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
-        
+
         # 1. reinterpret_cast to f32 (zero-cost bitcast)
         # vec_f32 = reinterpret_cast(vec_i32, Int32, ACC_NUM_COLS, Float32)
 
@@ -417,7 +416,7 @@ class _WsSsTf32CollectorKernel:
 
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
-        M, N, K = M_DIM, N_DIM, 8 # default K with 8
+        M, N, K = M_DIM, N_DIM, 8  # default K with 8
         ACC_NUM_COLS = N // 2
         NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
@@ -561,6 +560,7 @@ def test_ws_ss_f16():
             print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi, mj]:.6f} ref={ref[mi, mj]:.6f}")
             assert rel < 0.02, f"FAIL N={N}, K={K}: rel={rel:.4f}"
             print(f"  PASSED (N={N}, K={K})")
+
 
 def test_ws_ss_tf32_collector():
     """Explicit collector_b_buffer=B0, collector_op=DISCARD should match default."""

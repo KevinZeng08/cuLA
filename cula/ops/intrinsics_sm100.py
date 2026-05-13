@@ -347,6 +347,7 @@ def tcgen05_cp_128x256b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
 
     _do(Int32(taddr), smem_desc.desc_i64[0])
 
+
 @cute.jit
 def tcgen05_cp_128x128b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
     """Async copy SMEM → TMEM with shape ``128x128b`` (``cta_group::1``).
@@ -386,6 +387,7 @@ def tcgen05_cp_128x128b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
         )
 
     _do(Int32(taddr), smem_desc.desc_i64[0])
+
 
 @cute.jit
 def tcgen05_fence_before():
