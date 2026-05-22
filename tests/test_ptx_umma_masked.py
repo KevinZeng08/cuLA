@@ -1,3 +1,6 @@
+# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Standalone CuteDSL test for ptx_umma_masked.py inline PTX MMA wrappers.
 

@@ -1,3 +1,6 @@
+# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CuteDSL UMMA extension wrappers for SM100 (Blackwell) ``tcgen05.mma``.
 
 CuteDSL's high-level ``cute.gemm()`` / ``make_tiled_mma()`` API does not

@@ -1,3 +1,6 @@
+# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Standalone CuteDSL test for tcgen05.mma.ws (weight-stationary) inline PTX wrappers.
 
