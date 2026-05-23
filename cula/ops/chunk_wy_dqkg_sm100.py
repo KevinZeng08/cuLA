@@ -45,7 +45,7 @@ PRINT_DEBUG = False
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
 
-COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
+COMPILE_OPTIONS = "--enable-tvm-ffi"
 
 # Mapping from torch dtype to cutlass dtype (for beta_dtype conversion)
 _torch_to_cutlass_dtype = {
