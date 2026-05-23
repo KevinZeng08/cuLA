@@ -6,8 +6,6 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith as _arith
 from cutlass.cute.arch import (
     elect_one,
     mbarrier_arrive,
@@ -24,7 +22,6 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
-from cutlass.cutlass_dsl import dsl_user_op
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.ops.intrinsics_sm100 import (
@@ -35,6 +32,7 @@ from cula.ops.intrinsics_sm100 import (
     tcgen05_fence_before,
     tcgen05_ld_32x32b,
     tcgen05_st_32x32b,
+    umma_arrive,
 )
 from cula.ops.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
@@ -84,13 +82,11 @@ TMEM_TOTAL = 512
 # Bits: M>>4=4 at [24:28], N>>3=8 at [17:22], TransposeB at [16],
 #       btype=bf16(1) at [10:12], atype=bf16(1) at [7:9], dtype=f32(1) at [4:5]
 IDESC_F16_M64_N64_K_MN = (4 << 24) | (8 << 17) | (1 << 16) | (1 << 10) | (1 << 7) | (1 << 4)
-assert IDESC_F16_M64_N64_K_MN == 0x4110490
 
 # Instruction descriptor for M=64, N=128, BF16, dense, TransposeB=1
 # Bits: M>>4=4 at [24:28], N>>3=16 at [17:22], TransposeB at [16],
 #       btype=bf16(1) at [10:12], atype=bf16(1) at [7:9], dtype=f32(1) at [4:5]
 IDESC_F16_M64_N128_K_MN = (4 << 24) | (16 << 17) | (1 << 16) | (1 << 10) | (1 << 7) | (1 << 4)
-assert IDESC_F16_M64_N128_K_MN == 0x4210490
 
 # Instruction descriptor for M=64, N=128, BF16, dense
 # Bits: M>>4=4 at [24:28], N>>3=16 at [17:22],
@@ -102,7 +98,6 @@ IDESC_F16_M64_N128_K_K = (4 << 24) | (16 << 17) | (1 << 10) | (1 << 7) | (1 << 4
 #       TransposeB at [16], TransposeA at [15],
 #       btype=bf16(1) at [10:12], atype=bf16(1) at [7:9], dtype=f32(1) at [4:5]
 IDESC_F16_M64_N128_MN_MN = (4 << 24) | (16 << 17) | (1 << 16) | (1 << 15) | (1 << 10) | (1 << 7) | (1 << 4)
-assert IDESC_F16_M64_N128_MN_MN == 0x4218490
 
 # Instruction descriptor for M=64, N=64, BF16, dense, TransposeA=1, TransposeB=1
 # Bits: M>>4=4 at [24:28], N>>3=8 at [17:22],
@@ -117,30 +112,6 @@ IDESC_F16_M64_N64_MN_MN = (4 << 24) | (8 << 17) | (1 << 16) | (1 << 15) | (1 << 
 IDESC_F16_M64_N64_K_K = (4 << 24) | (8 << 17) | (1 << 10) | (1 << 7) | (1 << 4)
 
 ELEM_BYTES_BF16 = BFloat16.width // 8
-
-# ============================================================
-# Helpers: _ir, Float32 conversion
-# ============================================================
-
-
-def _ir(val, loc=None, ip=None):
-    return val.ir_value(loc=loc, ip=ip) if hasattr(val, "ir_value") else val
-
-
-@dsl_user_op
-def bf16_to_f32(val, *, loc=None, ip=None):
-    """Convert a BFloat16 value to Float32 using arith.extf (no inline asm)."""
-    bf16_ir = BFloat16(val).ir_value(loc=loc, ip=ip)
-    f32_ir = _arith.extf(ir.F32Type.get(), bf16_ir, loc=loc, ip=ip)
-    return Float32(f32_ir)
-
-
-@dsl_user_op
-def f32_to_bf16(val, *, loc=None, ip=None):
-    """Convert a Float32 value to BFloat16 using native arith.truncf."""
-    f32_ir = Float32(val).ir_value(loc=loc, ip=ip)
-    bf16_ir = _arith.truncf(BFloat16.mlir_type, f32_ir, loc=loc, ip=ip)
-    return BFloat16(bf16_ir)
 
 
 @cute.jit
@@ -374,13 +345,6 @@ def mma_ws_ss_m64n64_mn_mn_call(
             desc_b = desc_b_base + b_off
             tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_c, IDESC_F16_M64_N64_MN_MN, scale)
             scale = 1
-
-
-@cute.jit
-def umma_arrive(mbar_ptr: cute.Pointer):
-    """tcgen05.commit.cta_group::1.mbarrier::arrive::one — signal MMA done."""
-    with elect_one():
-        tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
 
 
 class ChunkKdaBwdWyDqkgFused:

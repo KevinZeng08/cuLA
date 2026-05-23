@@ -62,6 +62,8 @@ __all__ = [
     "reinterpret_cast",
     "subvec",
     "store_256b",
+    "umma_arrive",
+    "umma_arrive_noelect",
 ]
 
 import cutlass.cute as cute
@@ -70,6 +72,8 @@ from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass._mlir.dialects import vector as _vector
+from cutlass.cute.arch import elect_one
+from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -399,3 +403,16 @@ def tcgen05_fence_before():
 def tcgen05_fence_after():
     """tcgen05.fence::after_thread_sync — non-blocking ordering fence."""
     _nvvm.tcgen05_fence(kind=_nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+
+@cute.jit
+def umma_arrive(mbar_ptr: cute.Pointer):
+    """tcgen05.commit.cta_group::1.mbarrier::arrive::one — signal MMA done."""
+    with elect_one():
+        tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
+
+
+@cute.jit
+def umma_arrive_noelect(mbar_ptr: cute.Pointer):
+    """tcgen05.commit.cta_group::1.mbarrier::arrive::one — signal MMA done."""
+    tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
