@@ -66,7 +66,6 @@ def _exclusive_cumsum(a: list[int]):
 
 
 # ── TMEM column offset constants (cta_group::1, M=64, .ws Layout E) ──
-# See docs/chunk_wy_dqkg_design_doc.md §6.4
 TMEM_DA_ACC_OFF = 0  # [0,32)   32 cols  dA fp32 acc; Phase 3: [0,16) overwritten by dA_bf16
 TMEM_DQ_ACC_OFF = 32  # [32,96)  64 cols  dq fp32 acc; Phase 3: step2/step3 result [32,64)
 TMEM_DK_ACC_OFF = 96  # [96,160) 64 cols  dk fp32 acc
@@ -355,7 +354,6 @@ class ChunkKdaBwdWyDqkgFused:
     chunkwise delta-rule backward pass.
 
     Architecture: 1 CudaCore WG + 1 MMA warp + TMA/Aux warps.
-    See docs/chunk_kda_bwd_kernel_wy_dqkg_fused_blackwell_warpgroup_recommendation.md
     """
 
     def __init__(
