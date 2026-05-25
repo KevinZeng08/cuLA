@@ -14,11 +14,11 @@
 # limitations under the License.
 
 """
-bench_bwd_wy_dqkg_fused.py — Benchmark: cuLA CuTe DSL vs FLA Triton baseline
-                              for chunk_kda_bwd_wy_dqkg_fused kernel
+bench_kda_bwd_wy_dqkg_sm100.py — Benchmark: cuLA CuTe DSL vs FLA Triton baseline
+                                  for chunk_kda_bwd_wy_dqkg_fused kernel
 
 Compares:
-  - Accuracy: err_ratio, relative max diff, mean diff between cuLA and FLA outputs
+  - Accuracy: relative_rms_error, relative max diff between cuLA and FLA outputs
   - Performance: kernel execution time (ms) with CUDA events
 
 Modes:
@@ -26,10 +26,10 @@ Modes:
   - Varlen: variable-length sequences with different distributions
 
 Usage:
-  python bench_bwd_wy_dqkg_fused.py [--mode fixed|varlen|both] [--ncu] [--heads 32 64]
+  python bench_kda_bwd_wy_dqkg_sm100.py [--mode fixed|varlen|both] [--ncu] [--heads 32 64]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
-  ncu --set full -o report python bench_bwd_wy_dqkg_fused.py --mode fixed --ncu
+  ncu --set full -o report python bench_kda_bwd_wy_dqkg_sm100.py --mode fixed --ncu
 """
 
 import argparse
@@ -43,12 +43,14 @@ from fla.ops.kda.chunk_bwd import chunk_kda_bwd_wy_dqkg_fused as fla_chunk_kda_b
 
 from benchmarks.utils import (
     SEED,
+    benchmark_cuda_mode_fn,
     build_varlen_configs,
     exclusive_cumsum,
     prepare_bwd_wy_dqkg_fused_inputs,
+    relative_rms_error_rel_max_mean_abs,
     set_seed,
 )
-from cula.ops.chunk_wy_dqkg_sm100 import chunk_kda_bwd_wy_dqkg_fused as cutedsl_chunk_kda_bwd_wy_dqkg_fused
+from cula.ops.chunk_wy_dqkg_sm100 import chunk_kda_bwd_wy_dqkg_fused as cula_chunk_kda_bwd_wy_dqkg_fused
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -70,42 +72,6 @@ def generate_balanced_seqlens(total_tokens, num_seqs):
     base = total_tokens // num_seqs
     remainder = total_tokens % num_seqs
     return [base] * (num_seqs - 1) + [base + remainder]
-
-
-# ============================================================
-# Helpers
-# ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if NCU_MODE else WARMUP
-    if n_iters is None:
-        n_iters = 1 if NCU_MODE else N_ITERS
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
-
-
-def accuracy_stats(ref, out):
-    """Compute err_ratio, relative max diff, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    err = diff.flatten().pow(2).mean().sqrt().item()
-    base = ref_f.flatten().pow(2).mean().sqrt().item()
-    err_ratio = err / (base + 1e-8)
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.mean().item()
-    return err_ratio, rel_max, mean_diff
 
 
 # ============================================================
@@ -133,9 +99,9 @@ def run_fla_triton(inputs: dict):
     )
 
 
-def run_cutedsl(inputs: dict):
+def run_cula(inputs: dict):
     """Run the CuTe DSL Blackwell kernel."""
-    return cutedsl_chunk_kda_bwd_wy_dqkg_fused(
+    return cula_chunk_kda_bwd_wy_dqkg_fused(
         q=inputs["q"],
         k=inputs["k"],
         v=inputs["v"],
@@ -154,7 +120,7 @@ def run_cutedsl(inputs: dict):
     )
 
 
-def check_determinism(H=4, HV=None, total_T=2001, num_seqs=4, iters=1000, beta_dtype=DTYPE):
+def check_determinism(H=4, HV=None, total_T=2001, num_seqs=4, iters=1000):
     """Verify deterministic outputs across repeated runs."""
     if HV is None:
         HV = H
@@ -174,9 +140,9 @@ def check_determinism(H=4, HV=None, total_T=2001, num_seqs=4, iters=1000, beta_d
         cu_seqlens=cu_seqlens,
     )
 
-    ref_dq, ref_dk, ref_dv, ref_db, ref_dg, ref_dA = run_cutedsl(inputs)
+    ref_dq, ref_dk, ref_dv, ref_db, ref_dg, ref_dA = run_cula(inputs)
     for i in range(iters):
-        dq_out, dk_out, dv_out, db_out, dg_out, dA_out = run_cutedsl(inputs)
+        dq_out, dk_out, dv_out, db_out, dg_out, dA_out = run_cula(inputs)
         assert torch.isnan(dq_out).sum() == 0, f"dq contains NaNs at iter {i}"
         assert torch.isnan(dk_out).sum() == 0, f"dk contains NaNs at iter {i}"
         assert torch.isnan(dv_out).sum() == 0, f"dv contains NaNs at iter {i}"
@@ -231,26 +197,36 @@ def bench_fixed(configs, H: int, HV: int | None = None):
 
         # Accuracy
         ref = run_fla_triton(inputs)  # (dq, dk, dv, db, dg, dA)
-        out = run_cutedsl(inputs)  # (dq, dk, dv2, db, dg, dA)
+        out = run_cula(inputs)  # (dq, dk, dv, db, dg, dA)
         torch.cuda.synchronize()
 
         acc = {}
         names = ["dq", "dk", "dv", "db", "dg", "dA"]
         for name, r, o in zip(names, ref, out):
-            err_ratio, rel_max, mean_diff = accuracy_stats(r, o)
-            acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+            rel_rmse, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(r, o)
+            acc[name] = {"rel_rmse": rel_rmse, "rel_max": rel_max, "mean_diff": mean_diff}
 
-        # Timing
-        ms_fla = time_kernel(lambda: run_fla_triton(inputs))
-        ms_dsl = time_kernel(lambda: run_cutedsl(inputs))
-        speedup = ms_fla / ms_dsl if ms_dsl > 0 else float("inf")
+        # Performance
+        ms_fla = benchmark_cuda_mode_fn(
+            lambda: run_fla_triton(inputs),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            lambda: run_cula(inputs),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+        )
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         r = {
             "B": B,
             "T": T,
             "accuracy": acc,
             "ms_fla": ms_fla,
-            "ms_dsl": ms_dsl,
+            "ms_cula": ms_cula,
             "speedup": speedup,
         }
         results.append(r)
@@ -293,19 +269,29 @@ def bench_varlen(configs, H: int, HV: int | None = None):
 
         # Accuracy
         ref = run_fla_triton(inputs)
-        out = run_cutedsl(inputs)
+        out = run_cula(inputs)
         torch.cuda.synchronize()
 
         acc = {}
         names = ["dq", "dk", "dv", "db", "dg", "dA"]
         for name, r, o in zip(names, ref, out):
-            err_ratio, rel_max, mean_diff = accuracy_stats(r, o)
-            acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+            rel_rmse, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(r, o)
+            acc[name] = {"rel_rmse": rel_rmse, "rel_max": rel_max, "mean_diff": mean_diff}
 
-        # Timing
-        ms_fla = time_kernel(lambda: run_fla_triton(inputs))
-        ms_dsl = time_kernel(lambda: run_cutedsl(inputs))
-        speedup = ms_fla / ms_dsl if ms_dsl > 0 else float("inf")
+        # Performance
+        ms_fla = benchmark_cuda_mode_fn(
+            lambda: run_fla_triton(inputs),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            lambda: run_cula(inputs),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+        )
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
         min_l, max_l = min(seq_lens), max(seq_lens)
@@ -319,7 +305,7 @@ def bench_varlen(configs, H: int, HV: int | None = None):
             "n_seqs": n_seqs,
             "accuracy": acc,
             "ms_fla": ms_fla,
-            "ms_dsl": ms_dsl,
+            "ms_cula": ms_cula,
             "speedup": speedup,
         }
         results.append(r)
@@ -350,35 +336,35 @@ def print_report(fixed_results, varlen_results, H: int):
     if fixed_results:
         print("\n  [Fixed-Length]")
         print(f"  {'─' * 125}")
-        print(f"  {'B':>3s}  {'T':>5s}  │  {'FLA(ms)':>9s}  {'DSL(ms)':>9s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
+        print(f"  {'B':>3s}  {'T':>5s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>9s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
         print(f"  {'─' * 125}")
 
         for r in fixed_results:
             rel_max_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max', 0.0):10.6f}" for k in acc_keys)
-            err_ratio_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('err_ratio', 0.0):10.6f}" for k in acc_keys)
+            rel_rmse_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_rmse', 0.0):10.6f}" for k in acc_keys)
             print(
                 f"  {r['B']:3d}  {r['T']:5d}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_dsl']:9.4f}  {r['speedup']:7.2f}x  │  "
+                f"{r['ms_fla']:9.4f}  {r['ms_cula']:9.4f}  {r['speedup']:7.2f}x  │  "
                 f"{'rel_max:':>10s}{rel_max_vals}"
             )
-            print(f"  {'':3s}  {'':5s}  │  {'':9s}  {'':9s}  {'':8s}  │  {'err_ratio:':>10s}{err_ratio_vals}")
+            print(f"  {'':3s}  {'':5s}  │  {'':9s}  {'':9s}  {'':8s}  │  {'rel_rmse:':>10s}{rel_rmse_vals}")
         print(f"  {'─' * 125}")
 
     if varlen_results:
         print("\n  [Varlen]")
         print(f"  {'─' * 140}")
-        print(f"  {'Config':>45s}  │  {'FLA(ms)':>9s}  {'DSL(ms)':>9s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
+        print(f"  {'Config':>45s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>9s}  {'Speedup':>8s}  │  {'':>10s}{acc_header}")
         print(f"  {'─' * 140}")
 
         for r in varlen_results:
             rel_max_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max', 0.0):10.6f}" for k in acc_keys)
-            err_ratio_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('err_ratio', 0.0):10.6f}" for k in acc_keys)
+            rel_rmse_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_rmse', 0.0):10.6f}" for k in acc_keys)
             print(
                 f"  {r['tag']:>45s}  │  "
-                f"{r['ms_fla']:9.4f}  {r['ms_dsl']:9.4f}  {r['speedup']:7.2f}x  │  "
+                f"{r['ms_fla']:9.4f}  {r['ms_cula']:9.4f}  {r['speedup']:7.2f}x  │  "
                 f"{'rel_max:':>10s}{rel_max_vals}"
             )
-            print(f"  {'':>45s}  │  {'':9s}  {'':9s}  {'':8s}  │  {'err_ratio:':>10s}{err_ratio_vals}")
+            print(f"  {'':>45s}  │  {'':9s}  {'':9s}  {'':8s}  │  {'rel_rmse:':>10s}{rel_rmse_vals}")
         print(f"  {'─' * 140}")
 
     print(f"\n{sep}\n")
