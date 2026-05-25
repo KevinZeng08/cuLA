@@ -28,19 +28,25 @@ import pathlib
 import sys
 
 import torch
-import triton
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 
-from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
+from benchmarks.utils import (
+    SEED,
+    exclusive_cumsum,
+    generate_random_seq_lens,
+    prepare_intra_inputs,
+    relative_rms_error_rel_max_mean_abs_rhs,
+    triton_bench_fn,
+)
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
 B, H, D = 2, 64, 128
-HV = H   # overridable via --hv; HV > H enables GVA mode
+HV = H  # overridable via --hv; HV > H enables GVA mode
 BT = 64  # chunk size
 
 # Varlen benchmark params
@@ -50,18 +56,6 @@ MIN_SEQ_LEN = 63
 VARIANCE = 1.0
 
 DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
-
-
-def accuracy_stats(a, b):
-    """Compute RMSE, relative max diff, and mean absolute difference."""
-    a, b = a.float(), b.float()
-    diff = a - b
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.abs().max().item()
-    denom = b.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.abs().mean().item()
-    return rmse, rel_max, mean_diff
 
 
 # ==============================================================================
@@ -83,7 +77,7 @@ def benchmark_chunk_intra_uniform():
     )
     print("=" * 100)
     print(
-        f"{'B':>4} {'T':>7} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'B':>4} {'T':>7} │ {'rel_rmse':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
     print("─" * 100)
 
@@ -96,9 +90,17 @@ def benchmark_chunk_intra_uniform():
         )
 
         common = dict(
-            q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
-            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
-            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
 
         # Accuracy: run once and compare
@@ -106,15 +108,15 @@ def benchmark_chunk_intra_uniform():
         out_cula = cula_chunk_kda_fwd_intra(**common)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+        relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs_rhs(o_fla, o_cula)
 
         # Performance
-        ms_fla = triton.testing.do_bench(lambda: fla_chunk_kda_fwd_intra(**common))
-        ms_cula = triton.testing.do_bench(lambda: cula_chunk_kda_fwd_intra(**common))
+        ms_fla = triton_bench_fn(lambda: fla_chunk_kda_fwd_intra(**common))
+        ms_cula = triton_bench_fn(lambda: cula_chunk_kda_fwd_intra(**common))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{B:>4} {T:>7} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{B:>4} {T:>7} │ {relative_rms_error:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
     print("─" * 100)
@@ -140,7 +142,7 @@ def benchmark_chunk_intra_varlen():
     )
     print("=" * 110)
     print(
-        f"{'total_len':>10} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'total_len':>10} │ {'rel_rmse':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
     print("─" * 110)
 
@@ -154,9 +156,17 @@ def benchmark_chunk_intra_varlen():
         )
 
         common = dict(
-            q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
-            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
-            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
 
         # Accuracy
@@ -164,15 +174,15 @@ def benchmark_chunk_intra_varlen():
         out_cula = cula_chunk_kda_fwd_intra(**common)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+        relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs_rhs(o_fla, o_cula)
 
         # Performance
-        ms_fla = triton.testing.do_bench(lambda: fla_chunk_kda_fwd_intra(**common))
-        ms_cula = triton.testing.do_bench(lambda: cula_chunk_kda_fwd_intra(**common))
+        ms_fla = triton_bench_fn(lambda: fla_chunk_kda_fwd_intra(**common))
+        ms_cula = triton_bench_fn(lambda: cula_chunk_kda_fwd_intra(**common))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{total_len:>10} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{total_len:>10} │ {relative_rms_error:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
     print("─" * 110)
@@ -195,7 +205,7 @@ if __name__ == "__main__":
         "--hv",
         type=int,
         default=None,
-        help=f"Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
+        help="Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
     )
     args = parser.parse_args()
 
