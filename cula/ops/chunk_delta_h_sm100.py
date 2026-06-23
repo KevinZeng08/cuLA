@@ -18,6 +18,7 @@ BV must be a multiple of 64 (tcgen05.mma.ws M-mode constraint for bf16).
 """
 
 import argparse
+import os as _os
 
 import cutlass
 import cutlass.cute as cute
@@ -38,6 +39,16 @@ from fla.utils import tensor_cache
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
+
+
+# Intracard CP auto-dispatch
+def _intracard_cp_enabled() -> bool:
+    """Return whether intracard-CP is currently enabled (runtime check).
+
+    Env var truthiness matches FLA: any value other than "0" enables it.
+    Default (unset) is "0" → disabled.
+    """
+    return _os.environ.get("CULA_INTRACARD_CP", "0") != "0"
 
 
 # in FLA, cumsum returns int64 tensor by default
@@ -2015,6 +2026,8 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     persistent: bool = True,
+    _no_cp: bool = False,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -2046,6 +2059,33 @@ def chunk_gated_delta_rule_fwd_h(
         v_new:       [B, T, HV, V] bf16      (or None if save_new_value=False)
         final_state: [N, HV, K, V] fp32      (or None if output_final_state=False)
     """
+    # --- Intracard CP auto-dispatch ---
+    if _intracard_cp_enabled() and not _no_cp and cu_seqlens is not None and g is None and torch.is_inference_mode_enabled():
+        from cula.ops.cp.chunk_delta_h import intracard_fwd_h, should_use_intracard_cp
+        from cula.utils import get_device_sm_count
+
+        # Materialize cu_seqlens_cpu once here to avoid repeated D2H sync inside intracard_fwd_h.
+        _cu_seqlens_cpu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()
+        if should_use_intracard_cp(
+            _cu_seqlens_cpu,
+            get_device_sm_count(k.device),
+            k.shape[2],
+            chunk_size,
+        ):
+            return intracard_fwd_h(
+                k=k,
+                w=w,
+                u=u,
+                gk=gk,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+                save_new_value=save_new_value,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                cu_seqlens_cpu=_cu_seqlens_cpu,
+            )
+
     B, T, H, K_dim = k.shape
     HV = u.shape[2]
     V_dim = u.shape[3]
