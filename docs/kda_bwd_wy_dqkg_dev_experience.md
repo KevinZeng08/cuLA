@@ -8,15 +8,33 @@
 
 ### 一、项目概览
 
-KDA（Kimi Delta Attention，参见 [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) 及 [Kimi Linear 技术报告](https://yzhang.site/assets/pubs/techreport/2025/kda.pdf)）的 backward pass 中，`chunk_wy_dqkg_fused` 是计算量最大、最复杂的 kernel。它将 dq、dk、dv2、dg、db、dA 共 6 个梯度输出的计算融合在一个 persistent kernel 中，涉及 **9 个 GEMM（全 SS 模式）**、大量 CUDA Core element-wise 运算以及复杂的多 warp 数据流管道。
+KDA（Kimi Delta Attention，参见 [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) 及 [Kimi Linear 技术报告](https://yzhang.site/assets/pubs/techreport/2025/kda.pdf)）的 backward pass 中，`chunk_wy_dqkg_fused` 是访存量最大、最复杂的 kernel。它将 dq、dk、dv2、dg、db、dA 共 6 个梯度输出的计算融合在一个 persistent kernel 中，**单个 work unit 需要读取 11 个输入张量、写回 6 个输出张量**，涉及 **9 个 GEMM（全 SS 模式）**、大量 CUDA Core element-wise 运算以及复杂的多 warp 数据流管道。由于 chunk size 只有 64、各 GEMM 算术强度低，该 kernel 本质上是 **memory-bound**，性能上限由访存（HBM 带宽 + TMA 延迟）而非算力决定。
 
 对应的 Triton reference 实现位于 `fla.ops.kda.chunk_bwd.chunk_kda_bwd_kernel_wy_dqkg_fused`。
 
 #### 核心挑战
 
-- **计算密度极高**: 单 kernel 内含 V-loop 5 个 SS GEMM + Post-V 2 个 GEMM + Phase 3 dA 后处理 2 个 GEMM = **9 个 MMA**，加上大量 element-wise 后处理（gate exp、causal mask、reduce 等）
+本 kernel 的本质是一个 **memory-bound kernel**：虽然融合了 9 个 GEMM，但每个 GEMM 的 M 维只有 `BT=64`（chunk size），算术强度（arithmetic intensity）很低，单纯的 Tensor Core 计算量不足以喂饱 SM。真正的瓶颈在于**访存密度极高**——单个 work unit（一个 chunk × 一个 HV head）就需要吞吐 **11 个输入张量**、并吐出 **6 个输出张量**，因此整个 kernel 的性能上限由 HBM 带宽 + TMA 延迟决定，而非算力。
+
+- **访存密度极高（核心瓶颈）**: 一个 work unit 内需要搬运的张量（`BT=64`、`K=V=128` 时单 chunk 单 head 的 HBM 流量估算如下）：
+
+  | 方向 | 张量 | 形状 | dtype | 单 chunk 流量 |
+  |------|------|------|-------|--------------|
+  | 输入 | `q` / `k` | `[BT,K]` | bf16 | 16 KB × 2 |
+  | 输入 | `g`（gate，log 空间） | `[BT,K]` | **fp32** | 32 KB |
+  | 输入 | `beta` | `[BT]` | fp32 | ~0.25 KB |
+  | 输入 | `A`（attention-like 矩阵） | `[BT,BT]` | bf16 | 8 KB |
+  | 输入 | `v` / `v_new` / `do` / `dv` | `[BT,V]` | bf16 | 16 KB × 4 |
+  | 输入 | `h` / `dh`（**state 矩阵，访存大头**） | `[K,V]` | bf16 | 32 KB × 2 |
+  | 输出 | `dq` / `dk` / `dg` | `[BT,K]` | **fp32** | 32 KB × 3 |
+  | 输出 | `dv2` | `[BT,V]` | bf16 | 16 KB |
+  | 输出 | `db` | `[BT]` | fp32 | ~0.25 KB |
+  | 输出 | `dA` | `[BT,BT]` | fp32 | 16 KB |
+
+  合计约 **输入 200 KB + 输出 128 KB ≈ 330 KB / chunk / head**。其中 fp32 的 `g`、`dq`、`dk`、`dg` 以及 `[K,V]=128×128` 的 `h`/`dh` state 矩阵是绝对大头。由此 kernel 整体被访存（HBM 带宽 + TMA load/store 延迟）卡住，优化的核心思路因此是 **用 double buffer / pipeline 把 TMA load/store 延迟尽量掩盖在 MMA 之下，让 Tensor Core 不空等**（这也是为什么 A loop double buffer 能拿到最大的单项收益 12%）。
+- **计算融合复杂**: 单 kernel 内含 V-loop 5 个 SS GEMM + Post-V 2 个 GEMM + Phase 3 dA 后处理 2 个 GEMM = **9 个 MMA**，加上大量 element-wise 后处理（gate exp、causal mask、reduce 等）。GEMM 数量虽多，但因 M=64 都是小尺寸，无法掩盖上述访存开销
 - **TMEM 容量紧张**: 需要同时保持 dA、dq、dk、dw 4 个 fp32 accumulator + 若干临时 buffer
-- **SMEM 容量紧张**: 多个 tensor 的 double buffer + 各种 swizzle 布局 operand，occ=1 用满 227KB SMEM
+- **SMEM 容量紧张**: 上述众多输入/输出张量的 double buffer + 各种 swizzle 布局 operand，occ=1 用满 227KB SMEM
 - **寄存器压力巨大**: WG0/WG1 各需 208 个寄存器用于 element-wise 运算
 - **同步复杂度高**: 12 个 warp 间需要 18+ 条 barrier/pipeline 协调数据流
 
@@ -97,12 +115,12 @@ KDA（Kimi Delta Attention，参见 [flash-linear-attention](https://github.com/
 │  CUDA Core epilogue │  CUDA Core epilogue │  warp 8: MMA dispatch │
 │  208 regs/thread    │  208 regs/thread    │  warp 9: TMA Load     │
 │  head dim 低半      │  head dim 高半      │  warp 10-11: Aux I/O  │
-│  + TMA Store        │  + TMA Store        │  88 regs/thread       │
+│  + 直接 GMEM store  │  + 直接 GMEM store  │  88 regs/thread       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **设计动机**: wy_dqkg kernel 的 CUDA Core element-wise 运算（gate exp2、causal mask、dgk/db reduce、dg 计算等）需要同时持有多个 fp32 中间结果，消耗大量寄存器。如果与 MMA 放在同一 WG，寄存器溢出到 LMEM 导致严重性能退化。3-WG 分离后：
-- **WG0/WG1**: 各 4 个 warp（128 线程），在 head dim (BK=128) 维度切分，每个 WG 负责 64 列的 element-wise 运算（gate exp、dq/dk scale、kg 计算、dg 计算等），以及 epilogue 的 TMEM→Register drain + TMA store
+- **WG0/WG1**: 各 4 个 warp（128 线程），在 head dim (BK=128) 维度切分，每个 WG 负责 64 列的 element-wise 运算（gate exp、dq/dk scale、kg 计算、dg 计算等），以及 epilogue 的 TMEM→Register drain + 直接 GMEM store（`store_256b` 向量化 st.global，非 TMA）
 - **WG2**: 4 个 warp 分工明确——warp 8 负责 MMA dispatch（`elect_one` 发射 `tcgen05.mma.ws`），warp 9 负责 TMA G2S 加载，warp 10-11 负责辅助 IO（dg TMA store/reduce_add、gn 读取等）
 
 #### 2. tcgen05.mma.ws 指令使能与 SM100 intrinsics
@@ -296,7 +314,7 @@ Phase E: dA (Phase 3 后处理: 2 SS MMA + causal mask)    ← 验证门控 err_
 
 #### 3. Profile-Driven 优化
 
-所有性能优化都基于 NCU profile 数据驱动：
+由于 kernel 是 memory-bound，profile 的核心目标始终是**定位访存 stall（TMA load/store 等待）并设法用计算/双缓冲掩盖**。所有性能优化都基于 NCU profile 数据驱动：
 - **A loop double buffer**: NCU stall 分析显示 TMA load A 是最大的等待瓶颈 → stage=2
 - **TMEM offloading**: NCU 显示 register spill to LMEM 集中在 Post-V element-wise → dq_scaled 存 TMEM
 - **dg store → aux warp**: NCU timeline 显示 dg TMA store 与后续计算串行 → 移到 aux warp 异步执行
@@ -334,6 +352,8 @@ baseline (adapt from flashla)
   ─────────────────────────────
   总计: ~25%+ 累计优化
 ```
+
+可以看到，收益最大的几项（A loop double buffer +12%、dg store → aux warp +2.8%、TMEM offloading +6.8%）本质上都是在**掩盖访存延迟 / 解耦 IO 与计算**，这正印证了 kernel 的 memory-bound 属性——优化空间主要来自让 Tensor Core 不为访存空等，而非堆算力。
 
 **技术沉淀**:
 - 一套可复用的 SM100 `tcgen05.mma.ws` CuTeDSL 封装（`ptx_umma_ext.py`），定义 6 种 instruction descriptor（kernel 使用 4 种）、支持 K,K / K,MN / MN,MN 三种 transpose 模式
